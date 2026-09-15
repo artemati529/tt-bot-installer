@@ -1,0 +1,16 @@
+[tool.ruff.lint]
+# Осознанно принятые компромиссы (см. code review): не блокируют pre-commit.
+# BLE001 — резилиенс: часть Telegram-хендлеров и транзакционных откатов
+#   намеренно ловит любое исключение вместо падения на неизвестной ошибке.
+# SIM115 — единственный open() без контекст-менеджера обёрнут в try/finally
+#   с явным close().
+# TRY004 — валидаторы конфигов намеренно всегда бросают ValueError (единый
+#   контракт для вызывающих), а не TypeError для одной конкретной проверки.
+ignore = ["BLE001", "SIM115", "TRY004"]
+
+[tool.pytest.ini_options]
+# per_message=False в build_add_conversation() — намеренно (см. bot.py), но
+# pytest сбрасывает module-level warnings.filterwarnings() при сборе тестов.
+filterwarnings = [
+    "ignore:If 'per_message=False'.*CallbackQueryHandler.*will not be tracked:telegram.warnings.PTBUserWarning",
+]

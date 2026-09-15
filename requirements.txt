@@ -1,0 +1,6 @@
+# tt-bot — зависимости
+# Python 3.11+
+python-telegram-bot==21.11.1
+tomlkit==0.15.1
+qrcode==8.2
+pillow==12.3.0
