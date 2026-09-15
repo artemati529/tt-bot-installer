@@ -20,10 +20,10 @@ TrustTunnel** — это отдельный шаг, см. [официальны�
 
 ## Установка
 
-Одной командой:
+Одной командой (нужен root; не root — добавь `sudo` перед `bash`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/artemati529/tt-bot-installer/main/install.sh | $(command -v sudo || true) bash -s -
+curl -fsSL https://raw.githubusercontent.com/artemati529/tt-bot-installer/main/install.sh | bash -s -
 ```
 
 Или из клона:
@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/artemati529/tt-bot-installer/main/i
 ```bash
 git clone https://github.com/artemati529/tt-bot-installer.git
 cd tt-bot-installer
-$(command -v sudo || true) ./install.sh
+./install.sh
 ```
 
 Скрипт спросит `BOT_TOKEN`, `ALLOWED_USER_ID`, адрес VPN-эндпоинта
