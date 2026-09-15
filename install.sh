@@ -25,6 +25,7 @@ if [[ -z "$SCRIPT_DIR" || ! -f "$SCRIPT_DIR/bot.py" || ! -f "$SCRIPT_DIR/require
 TT_BOT_REPO_RAW to the repo's raw base URL, e.g.:
   curl -fsSL <raw-url>/install.sh | TT_BOT_REPO_RAW=<raw-url> bash -s -"
     SCRIPT_DIR="$(mktemp -d)"
+    trap 'rm -rf "$SCRIPT_DIR"' EXIT
     log "Fetching bot.py and requirements.txt from $TT_BOT_REPO_RAW..."
     curl -fsSL "$TT_BOT_REPO_RAW/bot.py" -o "$SCRIPT_DIR/bot.py"
     curl -fsSL "$TT_BOT_REPO_RAW/requirements.txt" -o "$SCRIPT_DIR/requirements.txt"
@@ -47,7 +48,8 @@ echo
 # ---------------------------------------------------------------------------
 # 1. Interactive prompts
 # ---------------------------------------------------------------------------
-read -rp "Telegram BOT_TOKEN (from @BotFather): " BOT_TOKEN < /dev/tty
+read -rsp "Telegram BOT_TOKEN (from @BotFather): " BOT_TOKEN < /dev/tty
+echo
 [[ -n "$BOT_TOKEN" ]] || die "BOT_TOKEN is required."
 
 read -rp "Your Telegram numeric user id (ALLOWED_USER_ID, see @userinfobot): " ALLOWED_USER_ID < /dev/tty

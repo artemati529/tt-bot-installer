@@ -301,7 +301,7 @@ VPN_MONITOR_PORT = int(env.get("VPN_MONITOR_PORT") or _detect_tt_listen_port() o
 BACKUP_KEEP_CREDENTIALS = max(1, int(env.get("BACKUP_KEEP_CREDENTIALS", "40")))
 BACKUP_KEEP_RULES = max(1, int(env.get("BACKUP_KEEP_RULES", "40")))
 BACKUP_KEEP_RESTORE_PREV = max(1, int(env.get("BACKUP_KEEP_RESTORE_PREV", "30")))
-BOT_LOCK_PATH = Path(env.get("BOT_LOCK_PATH", "/tmp/tt-bot.lock"))
+BOT_LOCK_PATH = Path(env.get("BOT_LOCK_PATH", "/run/tt-bot.lock"))
 
 if not ADDRESS:
     raise RuntimeError("ENDPOINT_ADDRESS пустой в /opt/tt-bot/.env (домен для -a в trusttunnel_endpoint)")
@@ -1683,8 +1683,21 @@ def list_files_in_latest_backup() -> list[str]:
         return []
 
 
+_PASSWORD_VALUE_RE = re.compile(r'password\s*=\s*"[^"]*"')
+
+
+def _mask_passwords(text: str) -> str:
+    return _PASSWORD_VALUE_RE.sub('password = "•••"', text)
+
+
 def _diff_against_latest_backup() -> str:
-    """Unified diff живых конфигов против latest-configs.tar.gz."""
+    """Unified diff живых конфигов против latest-configs.tar.gz.
+
+    Сравнение — на сырых значениях (иначе смена пароля с одинаковой маской
+    выглядела бы как отсутствие изменений); маска накладывается на готовый
+    текст диффа перед выдачей — credentials.toml не должен светить пароли
+    в чат plaintext'ом.
+    """
     bp = latest_backup_path()
     if not bp.exists():
         return "Бэкапа ещё нет — нечего сравнивать."
@@ -1720,7 +1733,7 @@ def _diff_against_latest_backup() -> str:
 
     if not diffs:
         return "Изменений нет — конфиги совпадают с последним бэкапом."
-    return "\n".join(diffs)
+    return _mask_passwords("\n".join(diffs))
 
 
 def _read_file_snapshot(path: Path) -> tuple[bytes | None, int | None]:
@@ -3746,6 +3759,17 @@ async def run_tt_upgrade_flow(bot, cid: int, context: ContextTypes.DEFAULT_TYPE)
         )
 
 
+async def run_os_upgrade_confirm(bot, cid: int, *, context: ContextTypes.DEFAULT_TYPE | None = None) -> None:
+    await send_ui_card(
+        bot,
+        cid,
+        "<b>🆙 Обновление ОС</b>\nМожет обновить ядро/системные библиотеки. Продолжить?",
+        context=context,
+        reply_markup=confirm_kb("osupd_yes", "osupd_no"),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def run_reboot_confirm(bot, cid: int, *, context: ContextTypes.DEFAULT_TYPE | None = None) -> None:
     await send_ui_card(
         bot,
@@ -4345,11 +4369,6 @@ async def srv_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     action = (q.data or "").split(":", 1)[1]
     cid = _chat_id(update)
-    if action == "osupd" and await _reject_if_busy(update):
-        # osupd, в отличие от backup/restore/reboot/ttupd, стартует операцию
-        # сразу здесь — без отдельного confirm-шага со своим CallbackRoute —
-        # так что занятость проверяем перед единственным ответом на callback.
-        return
     await cb_answer(q)
     if action == "restart":
         await tap_restart_tt(update, context)
@@ -4360,7 +4379,7 @@ async def srv_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ttupd":
         await run_tt_upgrade_flow(context.bot, cid, context)
     elif action == "osupd":
-        await run_os_upgrade(context.bot, cid, context=context)
+        await run_os_upgrade_confirm(context.bot, cid, context=context)
     elif action == "reboot":
         await run_reboot_confirm(context.bot, cid, context=context)
 
@@ -5696,6 +5715,27 @@ async def reboot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 
+async def os_upgrade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q:
+        return
+    data = q.data or ""
+    if data not in ("osupd_yes", "osupd_no"):
+        return
+    if data == "osupd_no":
+        await cb_answer(q, "Отменено")
+        await q.edit_message_text(
+            text=UI_OPEN_SERVER,
+            parse_mode=ParseMode.HTML,
+            reply_markup=server_hub_kb(),
+        )
+        return
+    if await _reject_if_busy(update):
+        return
+    await cb_answer(q)
+    await run_os_upgrade(context.bot, _chat_id(update), context=context)
+
+
 CallbackHandlerFn = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]
 
 
@@ -5720,6 +5760,7 @@ CALLBACK_ROUTES: tuple[CallbackRoute, ...] = (
     CallbackRoute("restore_backup_callback", r"^(resask:|resdo:|rescancel:)", restore_backup_callback),
     CallbackRoute("update_tt_callback", r"^ttupd_(yes|no)$", update_tt_callback, busy=False),
     CallbackRoute("reboot_callback", r"^(rbdo|rbcancel)$", reboot_callback, busy=False),
+    CallbackRoute("os_upgrade_callback", r"^osupd_(yes|no)$", os_upgrade_callback, busy=False),
     CallbackRoute("info_refresh_callback", r"^infor$", info_refresh_callback, busy=False),
     CallbackRoute("cert_refresh_callback", r"^certr$", cert_refresh_callback, busy=False),
     CallbackRoute("cert_log_callback", r"^certlog:", cert_log_callback, busy=False),
