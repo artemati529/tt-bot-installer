@@ -23,7 +23,7 @@ TrustTunnel** — это отдельный шаг, см. [официальны�
 Одной командой:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/artemati529/tt-bot-installer/main/install.sh | sudo bash -s -
+curl -fsSL https://raw.githubusercontent.com/artemati529/tt-bot-installer/main/install.sh | $(command -v sudo || true) bash -s -
 ```
 
 Или из клона:
@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/artemati529/tt-bot-installer/main/i
 ```bash
 git clone https://github.com/artemati529/tt-bot-installer.git
 cd tt-bot-installer
-sudo ./install.sh
+$(command -v sudo || true) ./install.sh
 ```
 
 Скрипт спросит `BOT_TOKEN`, `ALLOWED_USER_ID`, адрес VPN-эндпоинта
