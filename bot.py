@@ -100,7 +100,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import monotonic
-from typing import Any, TypedDict, cast
+from typing import Any, cast
 
 try:
     import tomlkit
@@ -275,18 +275,10 @@ def traced_callback(name: str, handler):
     return wrapper
 
 
-ERROR_NOTIFY_WINDOW_SEC = 300
-
-
-class _ErrorNotifyState(TypedDict):
-    window_start: float | None
-    suppressed: int
-
-
-_error_notify_state: _ErrorNotifyState = {"window_start": None, "suppressed": 0}
-
-
 async def log_unhandled_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Только лог (journalctl) — уведомление в чат убрано: сетевые обрывы были
+    основным источником сообщений, а не реальные баги, и само уведомление
+    ничего не даёт кроме отвлечения. Полный traceback остаётся в логах."""
     error = context.error
     route = None
     if isinstance(update, Update) and update.callback_query:
@@ -295,30 +287,6 @@ async def log_unhandled_error(update: object, context: ContextTypes.DEFAULT_TYPE
     if error is not None:
         exc_info = (type(error), error, error.__traceback__)
     logger.error("unhandled update error route=%s", route or "n/a", exc_info=exc_info)
-
-    # Дедуп: первая ошибка в окне шлётся сразу, дальнейшие — только считаются,
-    # чтобы повторяющийся сбой не спамил чат одинаковыми сообщениями.
-    now = monotonic()
-    window_start = _error_notify_state["window_start"]
-    if window_start is not None and now - window_start <= ERROR_NOTIFY_WINDOW_SEC:
-        _error_notify_state["suppressed"] += 1
-        return
-    suppressed = _error_notify_state["suppressed"]
-    _error_notify_state["window_start"] = now
-    _error_notify_state["suppressed"] = 0
-
-    chat_id = None
-    if isinstance(update, Update) and update.effective_chat is not None:
-        chat_id = _chat_id(update)
-    if chat_id is None:
-        chat_id = ALLOWED_USER_ID
-    text = "❌ <b>Внутренняя ошибка</b>\n<i>Детали: journalctl -u tt-bot</i>"
-    if suppressed:
-        text += f"\n<i>И ещё {suppressed} аналогичных за последние 5 минут.</i>"
-    try:
-        await send_inline_message(context.bot, chat_id, text, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.debug("Не удалось отправить уведомление об ошибке: %s", e)
 
 
 def _detect_tt_listen_port() -> int | None:
@@ -5474,12 +5442,13 @@ async def _undo_delete_user(q, payload: dict[str, Any]) -> None:
         return
     # Удаление сняло старый prefix — если он был случайным, новый deeplink
     # неизбежно другой, старая ссылка у клиента больше не рабочая.
+    mode_label = "prefix on" if random_prefix else "prefix off"
     await reply_deeplink_with_qr(
         msg,
         username=username,
         deeplink=deeplink,
         action_label="восстановление после удаления",
-        mode_label=_protocol_label(protocol),
+        mode_label=f"{mode_label} · {_protocol_label(protocol)}",
         png=png,
     )
 
@@ -5943,9 +5912,9 @@ def main():
             stale_busy,
         )
     # Дефолты PTB (5s read/connect/write, 1s pool) слишком жёсткие для сети с
-    # заминками — единичный сетевой тормоз превращается в TimedOut прямо в
-    # хендлере и «Внутреннюю ошибку» у пользователя. Даём больше времени и
-    # больше соединений в пуле, чтобы не биться в один короткий таймаут.
+    # заминками — единичный сетевой тормоз превращается в исключение прямо
+    # в хендлере. Даём больше времени и больше соединений в пуле, чтобы не
+    # биться в один короткий таймаут.
     request = HTTPXRequest(
         connection_pool_size=8,
         connect_timeout=10.0,

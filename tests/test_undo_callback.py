@@ -95,6 +95,8 @@ def test_undo_delete_user_restores_profile_and_sends_new_link(
     assert profile.get("protocol") == "quic"
     assert profile.get("random_prefix") is True
     update.callback_query.message.reply_photo.assert_awaited_once()
+    caption = update.callback_query.message.reply_photo.call_args.kwargs["caption"]
+    assert "prefix on" in caption, "mode_label должен включать состояние prefix, как при создании"
 
 
 def test_undo_restore_file_writes_back_previous_bytes(
