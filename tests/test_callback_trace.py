@@ -53,8 +53,8 @@ def test_callback_routes_are_registered_from_a_single_table(bot_tt):
     assert routes["nav_callback"].busy is False
     # srv_callback стал busy=False, чтобы "меню
     # работает" (обещание в карточках ОС/TT-апдейта) не было ложью для
-    # ВСЕГО раздела Сервер — busy-проверка осталась точечно на osupd
-    # (см. test_background_tasks.py::test_srv_osupd_rejects_while_busy).
+    # ВСЕГО раздела Сервер — busy-проверка теперь только на confirm-шагах
+    # (см. test_background_tasks.py::test_os_upgrade_confirm_rejects_while_busy).
     assert routes["srv_callback"].busy is False
     assert routes["reboot_callback"].pattern == r"^(rbdo|rbcancel)$"
     assert routes["reboot_callback"].busy is False

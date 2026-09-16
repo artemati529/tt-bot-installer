@@ -39,7 +39,7 @@ def test_user_quick_link_kb_uses_direct_toml(
     monkeypatch.setattr(bot_tt, "_export_bundle_sync", lambda username: ("tt://alice", b"png"))
     update = allowed_callback_update("ulink:alice")
 
-    run_async(bot_tt.user_quick_link_callback(update, context))
+    run_async(bot_tt.user_action_link_callback(update, context))
 
     context.bot.send_message.assert_awaited_once()
     datas = _callback_datas(context.bot.send_message.await_args.kwargs["reply_markup"])

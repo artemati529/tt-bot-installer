@@ -19,7 +19,7 @@ def test_deldo_success_sets_pending_undo(bot_tt, tt_paths, allowed_callback_upda
     assert info["kind"] == "delete_user"
     assert info["payload"]["username"] == "alice"
     assert info["payload"]["password"] == "secret"
-    assert info["payload"]["protocol"] == "quic"
+    assert "protocol" not in info["payload"]
 
     kb = update.callback_query.edit_message_text.call_args.kwargs["reply_markup"]
     buttons = [b.callback_data for row in kb.inline_keyboard for b in row]

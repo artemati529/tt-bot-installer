@@ -29,15 +29,48 @@ FILE MAP (секции сверху вниз):
                                     add_user_and_make_link, rotate/delete user, versions
   11. Actions & background tasks  — build_add_conversation, run_* (backup/restore/
                                     os_upgrade/tt_upgrade/reboot), run_user_pick,
-                                    _*_sync, _schedule_background_task
+                                    _*_sync, _schedule_background_task, confirm-колбэки
+                                    (backup_confirm/restore_backup/reboot/os_upgrade/
+                                    update_tt/restart_tt_confirm), undo_callback
   12. Navigation & command handlers— send_home_screen, nav/srv/vpn/copyhost callbacks,
-                                    user_quick_* callbacks, rules_sync, user search,
+                                    user_action_* callbacks, delete_user_callback,
+                                    cert_log_callback, rules_sync, user search,
                                     /start /status /myid, menu
   13. Scaffold & add-flow         — _burn_scaffold/_track_*/_cleanup_*, add_entry_cb,
                                     add_username/password/prefix/protocol,
                                     rotate/export pick, toml_export
   14. Route table & main          — CallbackRoute, CALLBACK_ROUTES,
                                     build_callback_query_handler, main()
+
+CALLBACK_DATA REGISTRY (префикс → что открывает; полная сверка — CALLBACK_ROUTES,
+секция 14; префиксы не переименовывать — старые кнопки могут висеть в чатах):
+  nav:*                      — навигация (home/vpn/server/close/servercard/info/
+                               clients/users:N/logs/cert)
+  srv:*                      — меню «Сервер» (restart/backup/restore/ttupd/osupd/reboot)
+  vpn:*                      — меню «VPN» (find/rotate/export/del); vpn:add — старт
+                               ConversationHandler добавления пользователя
+  addpref:*/addproto:*/addcancel — шаги ConversationHandler добавления (вне CALLBACK_ROUTES)
+  copyhost:msg               — карточка с доменом endpoint
+  rotpick:/exppick:/expproto: — ротация/экспорт пароля для пользователя из списка
+  tc:/tp:                    — выбор протокола и выдача TOML-конфига
+  delask:/del2:/deldo:/delcancel: — 2-шаговое подтверждение удаления пользователя
+  resask:/resdo:/rescancel:  — подтверждение восстановления файла(ов) из бэкапа
+  ttupd_yes|no, rbdo|rbcancel, osupd_yes|no, ttrst_yes|no, bak:yes|no — confirm-пары
+  infor                      — обновить карточку «Сервер»
+  certlog:20|50              — хвост лога certbot (N строк)
+  searchcancel               — отмена поиска пользователя
+  ss:/ul:/uf:/udev:          — постраничные списки клиентов/пользователей, фильтр,
+                               карточка пользователя
+  uqr:|ure:/utc:/ulink:/uall:/urot:/udel: — быстрые действия над юзером из списка
+                               (QR/TOML/ссылка/всё сразу/ротация/удаление)
+  rulesync:clean|repair|view — синхронизация rules.toml
+  logf:*                     — фильтр лога (level:lines:chunk)
+  undo:go                    — отмена последнего delete/rotate/restore
+
+_SYNC КОНВЕНЦИЯ: суффикс _sync = функция блокирующая, вызывать только через
+asyncio.to_thread. Не добавлять суффикс доменным функциям про файлы/данные
+(create_configs_backup и т.п.) — суффикс только для функций, дёргающих
+подпроцессы/systemctl/сеть.
 """
 
 import asyncio
@@ -68,7 +101,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from time import monotonic
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 try:
     import tomlkit
@@ -169,6 +202,8 @@ CALLBACK_ROUTES_WITH_USER_ARGS = {
     "uqr",
     "ure",
     "utc",
+    "ulink",
+    "uall",
     "tc",
     "tp",
     "urot",
@@ -242,7 +277,14 @@ def traced_callback(name: str, handler):
 
 
 ERROR_NOTIFY_WINDOW_SEC = 300
-_error_notify_state = {"window_start": 0.0, "suppressed": 0}
+
+
+class _ErrorNotifyState(TypedDict):
+    window_start: float | None
+    suppressed: int
+
+
+_error_notify_state: _ErrorNotifyState = {"window_start": None, "suppressed": 0}
 
 
 async def log_unhandled_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -258,7 +300,8 @@ async def log_unhandled_error(update: object, context: ContextTypes.DEFAULT_TYPE
     # Дедуп: первая ошибка в окне шлётся сразу, дальнейшие — только считаются,
     # чтобы повторяющийся сбой не спамил чат одинаковыми сообщениями.
     now = monotonic()
-    if now - _error_notify_state["window_start"] <= ERROR_NOTIFY_WINDOW_SEC:
+    window_start = _error_notify_state["window_start"]
+    if window_start is not None and now - window_start <= ERROR_NOTIFY_WINDOW_SEC:
         _error_notify_state["suppressed"] += 1
         return
     suppressed = _error_notify_state["suppressed"]
@@ -330,11 +373,12 @@ def _client_endpoint_address(address: str) -> str:
 
 def is_allowed(update: Update) -> bool:
     u = update.effective_user
-    if not u:
+    chat = update.effective_chat
+    if not u or not chat:
         return False
-    ok = u.id == ALLOWED_USER_ID
+    ok = u.id == ALLOWED_USER_ID and chat.type == "private"
     if not ok:
-        logger.warning("access denied user_id=%s username=%s", u.id, u.username or "")
+        logger.warning("access denied user_id=%s username=%s chat_type=%s", u.id, u.username or "", getattr(chat, "type", ""))
     return ok
 
 
@@ -409,7 +453,11 @@ async def reset_nav_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     await cancel_add_flow(context)
 
 
-def clip_text(text: str, limit: int = 3800) -> str:
+CLIP_TEXT_LIMIT = 3800
+CLIP_TEXT_LIMIT_IN_BLOCKQUOTE = 3500  # запас под <blockquote>/<pre>-обвязку и остальной текст карточки
+
+
+def clip_text(text: str, limit: int = CLIP_TEXT_LIMIT) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 20] + "\n\n...output truncated"
@@ -442,14 +490,33 @@ def _with_undo_row(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Отменить", callback_data="undo:go")], *kb.inline_keyboard])
 
 
+BUSY_MARKER_FILE = TT_DIR / ".tt-bot-busy"
+
+
 def busy_set(what: str) -> None:
     BUSY_INFO.clear()
     BUSY_INFO["what"] = what
     BUSY_INFO["started"] = monotonic()
+    try:
+        BUSY_MARKER_FILE.write_text(what, encoding="utf-8")
+    except OSError:
+        pass
 
 
 def busy_clear() -> None:
     BUSY_INFO.clear()
+    BUSY_MARKER_FILE.unlink(missing_ok=True)
+
+
+def _consume_stale_busy_marker() -> str | None:
+    """При старте: маркер занятости с прошлого процесса значит, что apt/
+    systemctl-операция могла не завершиться штатно (бота убили посреди неё)."""
+    try:
+        what = BUSY_MARKER_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    BUSY_MARKER_FILE.unlink(missing_ok=True)
+    return what or None
 
 
 def busy_label() -> str | None:
@@ -510,6 +577,15 @@ async def safe_edit_message_text(message, text: str, **kwargs) -> bool:
         if is_message_not_modified(e):
             return False
         raise
+
+
+async def best_effort_edit(message, text: str, **kwargs) -> None:
+    """Для except-блоков, которые уже сообщают об ошибке: если сам edit
+    тоже падает (сообщение успели удалить), не роняем обработчик второй раз."""
+    try:
+        await safe_edit_message_text(message, text, **kwargs)
+    except Exception:
+        logger.debug("Не удалось отобразить сообщение об ошибке")
 
 
 def _remember_ui_message(context: ContextTypes.DEFAULT_TYPE, message: Message | None) -> None:
@@ -584,14 +660,14 @@ async def upsert_ui_message(
     _ud(context)[UI_MESSAGE_ID_KEY] = msg.message_id
 
 
-def ui_error(reason: str, what_next: str | None = None) -> str:
+def error_card(reason: str, what_next: str | None = None) -> str:
     text = f"❌ <b>{reason}</b>"
     if what_next:
         text += f"\n<i>Что делать: {what_next}</i>"
     return text
 
 
-def ui_step(title: str, step: int, total: int, action: str) -> str:
+def step_card(title: str, step: int, total: int, action: str) -> str:
     return f"⏳ <b>{title}</b>\n[{step}/{total}] {action}"
 
 
@@ -665,6 +741,11 @@ def html_pre_block(body: str) -> str:
     return f"<pre>{esc}</pre>"
 
 
+def html_expandable_pre_block(body: str) -> str:
+    esc = html.escape(body.strip())
+    return f"<blockquote expandable><pre>{esc}</pre></blockquote>"
+
+
 CLIENTS_PER_PAGE = 8
 USERS_PER_PAGE = 6
 LOG_ERR_RE = re.compile(r"(error|exception|fail|traceback|critical)", re.IGNORECASE)
@@ -734,18 +815,22 @@ async def reply_deeplink_with_qr(
         # заморозит бота на весь timeout.
         svc = await asyncio.to_thread(run_cmd, ["systemctl", "is-active", SERVICE_NAME]) or "unknown"
         lines.append(f"Сервис: <code>{html.escape(svc)}</code>")
+    # Ссылка несёт credential (deeplink целиком) в query — под спойлером,
+    # как и текстовая выдача deeplink (см. deeplink_spoiler_html).
     cap = (
         "\n".join(lines)
         + "\n\n"
-        f"<a href=\"{html.escape(qr_url)}\">Открыть deeplink trusttunnel.org/qr</a>"
+        f"<tg-spoiler><a href=\"{html.escape(qr_url)}\">Открыть deeplink trusttunnel.org/qr</a></tg-spoiler>"
     )
     if len(cap) > TG_CAPTION_SAFE:
         cap = cap[: TG_CAPTION_SAFE - 3] + "…"
-    kb_rows: list[list[InlineKeyboardButton]] = [
-        *(extra_rows or []),
-        [InlineKeyboardButton("📄 TOML", callback_data=f"utc:{username}")],
-        [InlineKeyboardButton("🏠 Главная", callback_data="nav:home")],
-    ]
+    kb_rows: list[list[InlineKeyboardButton]] = [*(extra_rows or [])]
+    if _HAS_COPY_TEXT and CopyTextButton is not None:
+        kb_rows.append(
+            [InlineKeyboardButton("📋 Копировать deeplink", copy_text=CopyTextButton(text=deeplink))]
+        )
+    kb_rows.append([InlineKeyboardButton("📄 TOML", callback_data=f"utc:{username}")])
+    kb_rows.append([InlineKeyboardButton("🏠 Главная", callback_data="nav:home")])
     kb = InlineKeyboardMarkup(kb_rows)
     await message.reply_photo(
         photo=InputFile(io.BytesIO(data), filename="trusttunnel-qr.png"),
@@ -793,10 +878,12 @@ def confirm_kb(
     *,
     yes_label: str = "✅ Да",
     no_label: str = "❌ Отмена",
+    danger: bool = False,
 ) -> InlineKeyboardMarkup:
+    yes_style = "danger" if danger else "success"
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(yes_label, callback_data=yes_cb)],
+            [InlineKeyboardButton(yes_label, callback_data=yes_cb, style=yes_style)],
             [InlineKeyboardButton(no_label, callback_data=no_cb)],
         ]
     )
@@ -816,7 +903,7 @@ BACK_PARENT = {
 
 
 def card_footer_row(parent: str) -> list[InlineKeyboardButton]:
-    return [InlineKeyboardButton("⬅️ Назад", callback_data=BACK_PARENT.get(parent, "nav:home"))]
+    return [InlineKeyboardButton("⬅️ Назад", callback_data=BACK_PARENT.get(parent, "nav:home"), style="success")]
 
 
 def refresh_back_row(refresh_cb: str, parent: str) -> list[InlineKeyboardButton]:
@@ -1461,17 +1548,26 @@ def _fetch_metrics_clients() -> list[dict[str, Any]] | None:
     return cached_compute("metrics_clients", MONITOR_CACHE_TTL_SEC, _produce)
 
 
+def _parse_metric_item(item: dict[str, Any]) -> tuple[str, int]:
+    """(username, sessions); sessions=0 если значение битое."""
+    username = str(item.get("username") or "").strip()
+    try:
+        sessions = int(item.get("sessions") or 0)
+    except (TypeError, ValueError):
+        sessions = 0
+    return username, sessions
+
+
 def _aggregate_sessions_from_metrics(
     items: list[dict[str, Any]],
 ) -> tuple[Counter[str], dict[str, str]]:
     cnt: Counter[str] = Counter()
     labels: dict[str, str] = {}
     for item in items:
-        username = str(item.get("username") or "").strip()
+        username, sessions = _parse_metric_item(item)
         if not username:
             continue
         key = f"u:{username}"
-        sessions = int(item.get("sessions") or 0)
         cnt[key] = sessions
         ip = item.get("ip")
 
@@ -1804,13 +1900,19 @@ def restore_file_from_latest_backup(filename: str, *, restart_service: bool = Tr
 def restore_multiple_from_latest_backup(filenames: list[str]) -> tuple[bool, str]:
     if not filenames:
         return False, "Не выбраны файлы для восстановления."
+    snapshot = _snapshot_tt_files([TT_DIR / name for name in filenames])
     restored: list[str] = []
     for name in filenames:
         ok, info = restore_file_from_latest_backup(name, restart_service=False)
         if not ok:
+            _restore_tt_files(snapshot)
             return False, info
         restored.append(name)
-    apply_tt_config_change()
+    try:
+        apply_tt_config_change()
+    except Exception:
+        _restore_tt_files(snapshot)
+        return False, "Не удалось применить восстановленные файлы — откат выполнен."
     return True, ", ".join(restored)
 
 
@@ -1828,15 +1930,19 @@ def _stamped_backup(
     dir_mode: int | None = None,
     file_mode: int | None = None,
 ) -> Path:
-    """Копия со штампом времени + прунинг старых: `<dir_path>/<stem>-<timestamp><suffix>`."""
+    """Копия со штампом времени + прунинг старых: `<dir_path>/<stem>-<timestamp><suffix>`.
+
+    dir_path.mkdir рождается с дефолтным umask до chmod(dir_mode) — окно
+    короткое (одна операция), а вот файл пишем через _atomic_write_bytes:
+    NamedTemporaryFile всегда 0600 независимо от umask, так что для
+    file_mode=0600 (пароли) окна с широкими правами нет вообще.
+    """
     dir_path.mkdir(parents=True, exist_ok=True)
     if dir_mode is not None:
         dir_path.chmod(dir_mode)
     stamp = _backup_timestamp()
     path = dir_path / f"{stem}-{stamp}{suffix}"
-    path.write_text(data, encoding="utf-8")
-    if file_mode is not None:
-        path.chmod(file_mode)
+    _atomic_write_bytes(path, data.encode("utf-8"), mode=file_mode)
     _prune_backup_dir(dir_path, f"{stem}-*{suffix}", keep)
     return path
 
@@ -2245,9 +2351,7 @@ def _prefix_for_username(username: str) -> str | None:
 
 def _export_context_for_username(username: str) -> tuple[str | None, str]:
     profile = _get_user_profile(username)
-    proto = str(profile.get("protocol", "h2"))
-    if proto not in ("h2", "quic"):
-        proto = "h2"
+    proto = _normalize_protocol(str(profile.get("protocol", "h2")))
     return _prefix_for_username(username), proto
 
 
@@ -2337,20 +2441,20 @@ def build_rules_sync_report() -> str:
     if audit["orphan_rule_prefixes"]:
         lines.append(
             "<b>Лишние allow-правила (префикс не в user_prefix_map)</b>\n"
-            + html_pre_block("\n".join(audit["orphan_rule_prefixes"]))
+            + html_expandable_pre_block("\n".join(audit["orphan_rule_prefixes"]))
         )
     else:
         lines.append("<blockquote>Лишних allow-правил не найдено.</blockquote>")
     if audit["missing_rules"]:
         body = "\n".join(f"{u} → {p}" for u, p in audit["missing_rules"].items())
-        lines.append("<b>Нет allow-правила для пользователя</b>\n" + html_pre_block(body))
+        lines.append("<b>Нет allow-правила для пользователя</b>\n" + html_expandable_pre_block(body))
     if audit["orphan_map_entries"]:
         body = "\n".join(f"{u} → {p}" for u, p in audit["orphan_map_entries"].items())
-        lines.append("<b>Записи в user_prefix_map без пользователя</b>\n" + html_pre_block(body))
+        lines.append("<b>Записи в user_prefix_map без пользователя</b>\n" + html_expandable_pre_block(body))
     if audit["stale_profiles"]:
         lines.append(
             "<b>Профиль с random_prefix, но нет в map</b>\n"
-            + html_pre_block(", ".join(audit["stale_profiles"]))
+            + html_expandable_pre_block(", ".join(audit["stale_profiles"]))
         )
     if not any(
         (
@@ -2374,14 +2478,8 @@ def _active_usernames_from_metrics(items: list[dict[str, Any]] | None = None) ->
         items = _fetch_metrics_clients() or []
     active: set[str] = set()
     for item in items:
-        username = str(item.get("username") or "").strip()
-        if not username:
-            continue
-        try:
-            sessions = int(item.get("sessions") or 0)
-        except (TypeError, ValueError):
-            sessions = 0
-        if sessions > 0:
+        username, sessions = _parse_metric_item(item)
+        if username and sessions > 0:
             active.add(username)
     return active
 
@@ -2473,7 +2571,7 @@ def user_detail_inline_kb(username: str) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("🔐 Пароль", callback_data=f"urot:{username}"),
-            InlineKeyboardButton("🗑 Удалить", callback_data=f"udel:{username}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"udel:{username}", style="danger"),
         ],
         card_footer_row("user"),
     )
@@ -2541,7 +2639,7 @@ def rotate_password_prompt_text(username: str) -> str:
 
 
 def rotate_password_back_kb(callback_data: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=callback_data)]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data=callback_data, style="success")]])
 
 
 def begin_rotate_password_wait(context: ContextTypes.DEFAULT_TYPE, username: str) -> None:
@@ -2557,7 +2655,7 @@ def delete_user_confirm_text(username: str) -> str:
 
 
 def delete_user_confirm_kb(username: str) -> InlineKeyboardMarkup:
-    return confirm_kb(f"del2:{username}", f"delcancel:{username}")
+    return confirm_kb(f"del2:{username}", f"delcancel:{username}", danger=True)
 
 
 _DEEPLINK_TAG_HAS_IPV6 = 0x04
@@ -2676,7 +2774,6 @@ def generate_deeplink(
     *,
     generate_new_prefix: bool = False,
     client_random_prefix: str | None = None,
-    protocol: str | None = None,
 ) -> str:
     cmd = [
         "./trusttunnel_endpoint",
@@ -2691,7 +2788,7 @@ def generate_deeplink(
         "--name",
         SERVER_NAME,
     ]
-    upstreams = _protocol_dns_values(protocol or "")
+    upstreams = _protocol_dns_values()
     for dns in upstreams:
         cmd.extend(["--dns-upstream", dns])
     if client_random_prefix:
@@ -2713,11 +2810,9 @@ def generate_deeplink(
     raise RuntimeError("Не удалось получить deeplink")
 
 
-def _protocol_dns_values(protocol: str) -> list[str]:
-    # protocol не влияет на результат: DoQ идёт своим QUIC-подключением
-    # независимо от протокола тоннеля, поэтому оба апстрима нужны всегда.
-    # Параметр оставлен для симметрии с вызывающими (которые знают протокол).
-    del protocol
+def _protocol_dns_values() -> list[str]:
+    # DoQ идёт своим QUIC-подключением независимо от протокола тоннеля,
+    # поэтому оба апстрима нужны всегда.
     return [
         "https://dns.adguard-dns.com/dns-query",
         "quic://dns.adguard-dns.com",
@@ -2726,6 +2821,17 @@ def _protocol_dns_values(protocol: str) -> list[str]:
 
 def _protocol_label(protocol: str) -> str:
     return "QUIC" if (protocol or "").strip().lower() == "quic" else "HTTP/2"
+
+
+def _normalize_protocol(value: str | None) -> str:
+    return value if value in ("h2", "quic") else "h2"
+
+
+async def _load_export_profile(username: str) -> tuple[str, bool]:
+    prof = await asyncio.to_thread(_get_user_profile, username)
+    protocol = _normalize_protocol(str(prof.get("protocol", "h2")))
+    random_prefix = bool(prof.get("random_prefix"))
+    return protocol, random_prefix
 
 
 def _protocol_kb_rows(make_cb) -> list[list[InlineKeyboardButton]]:
@@ -2883,7 +2989,6 @@ def add_user_and_make_link(
     password: str,
     *,
     random_prefix: bool = False,
-    protocol: str | None = None,
 ) -> str:
     if not USERNAME_RE.fullmatch(username):
         raise ValueError("Некорректный username")
@@ -2914,9 +3019,7 @@ def add_user_and_make_link(
     rollback_prefix: str | None = None
     try:
         before_prefixes = set(_extract_allow_prefixes()) if random_prefix else set()
-        deeplink = generate_deeplink(
-            username, generate_new_prefix=random_prefix, protocol=protocol
-        )
+        deeplink = generate_deeplink(username, generate_new_prefix=random_prefix)
         if random_prefix:
             after_prefixes = _extract_allow_prefixes()
             new_prefixes = [p for p in after_prefixes if p not in before_prefixes]
@@ -3055,6 +3158,14 @@ def is_newer(latest: str, current: str) -> bool:
 def build_add_conversation() -> ConversationHandler:
     # per_message=False: кнопки "Отмена / С префиксом / Протокол" живут на
     # отдельных сообщениях — не на стартовом. Без этого inline-кнопки не сработают.
+    # addcancel зарегистрирован в каждом состоянии: исходная кнопка "Отмена"
+    # остаётся видна на экране весь диалог, а не только на первом шаге.
+    def _addcancel_handler() -> CallbackQueryHandler:
+        return CallbackQueryHandler(
+            traced_callback("add_cancel_callback", busy_guard(allow_guard(add_cancel_callback, conv_end=True))),
+            pattern=r"^addcancel$",
+        )
+
     return ConversationHandler(
         entry_points=[
             CallbackQueryHandler(
@@ -3064,24 +3175,26 @@ def build_add_conversation() -> ConversationHandler:
         ],
         states={
             ASK_ADD_USERNAME: [
-                CallbackQueryHandler(
-                    traced_callback("add_cancel_callback", busy_guard(allow_guard(add_cancel_callback, conv_end=True))),
-                    pattern=r"^addcancel$",
-                ),
+                _addcancel_handler(),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, allow_guard(add_username, conv_end=True)),
             ],
-            ASK_ADD_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, allow_guard(add_password, conv_end=True))],
+            ASK_ADD_PASSWORD: [
+                _addcancel_handler(),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, allow_guard(add_password, conv_end=True)),
+            ],
             ASK_ADD_PREFIX: [
+                _addcancel_handler(),
                 CallbackQueryHandler(
                     traced_callback("add_prefix_choice", busy_guard(allow_guard(add_prefix_choice, conv_end=True))),
                     pattern=r"^addpref:",
-                )
+                ),
             ],
             ASK_ADD_PROTOCOL: [
+                _addcancel_handler(),
                 CallbackQueryHandler(
                     traced_callback("add_protocol_choice", busy_guard(allow_guard(add_protocol_choice, conv_end=True))),
                     pattern=r"^addproto:",
-                )
+                ),
             ],
         },
         fallbacks=[CommandHandler("cancel", allow_guard(cancel, conv_end=True))],
@@ -3104,14 +3217,7 @@ def info_card_inline_kb() -> InlineKeyboardMarkup:
 
 
 def cert_card_inline_kb() -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    rows.append([InlineKeyboardButton("♻️ Renew TT", callback_data="certupd:ask")])
-    rows.append(
-        [
-            InlineKeyboardButton("🔄 Обновить", callback_data="certr"),
-            InlineKeyboardButton("📄 Certbot log", callback_data="certlog:20"),
-        ]
-    )
+    rows: list[list[InlineKeyboardButton]] = [[InlineKeyboardButton("📄 Certbot log", callback_data="certlog:20")]]
     return merge_inline_kb(*rows, card_footer_row("server"))
 
 
@@ -3160,7 +3266,7 @@ def _ram_health_summary() -> str:
     )
 
 
-async def run_infosrv(
+async def run_info_card(
     bot,
     cid: int,
     *,
@@ -3188,7 +3294,7 @@ async def run_infosrv(
         await send_ui_card(
             bot,
             cid,
-            ui_error("Не удалось получить информацию о сервере.", "нажми «🔄 Обновить» или проверь сервис"),
+            error_card("Не удалось получить информацию о сервере.", "нажми «🔄 Обновить» или проверь сервис"),
             context=context,
             parse_mode=ParseMode.HTML,
             force_new=True,
@@ -3225,7 +3331,7 @@ async def run_server_card(
         await send_ui_card(
             bot,
             cid,
-            ui_error("Не удалось показать карточку сервера.", "повтори запрос через меню «Сервер»"),
+            error_card("Не удалось показать карточку сервера.", "повтори запрос через меню «Сервер»"),
             context=context,
             parse_mode=ParseMode.HTML,
             force_new=True,
@@ -3255,6 +3361,7 @@ async def run_user_pick(
     title: str,
     cb_prefix: str,
     button_prefix: str = "",
+    button_style: str | None = None,
     empty_hint: str,
     too_long_title: str,
     too_long_hint: str,
@@ -3269,7 +3376,7 @@ async def run_user_pick(
             await send_ui_card(
                 bot,
                 cid,
-                ui_error("Список пользователей пуст.", empty_hint),
+                error_card("Список пользователей пуст.", empty_hint),
                 context=context,
                 parse_mode=ParseMode.HTML,
                 force_new=True,
@@ -3279,14 +3386,17 @@ async def run_user_pick(
             await send_ui_card(
                 bot,
                 cid,
-                ui_error(too_long_title, too_long_hint),
+                error_card(too_long_title, too_long_hint),
                 context=context,
                 parse_mode=ParseMode.HTML,
                 force_new=True,
             )
             return
         extra = f"\n\n<i>{hidden_hint}</i>" if has_hidden else ""
-        buttons = [InlineKeyboardButton(f"{button_prefix}{u}", callback_data=f"{cb_prefix}:{u}") for u in safe]
+        buttons = [
+            InlineKeyboardButton(f"{button_prefix}{u}", callback_data=f"{cb_prefix}:{u}", style=button_style)
+            for u in safe
+        ]
         keyboard = [[b] for b in buttons]
         keyboard.append(card_footer_row("users"))
         await send_ui_card(
@@ -3303,7 +3413,7 @@ async def run_user_pick(
         await send_ui_card(
             bot,
             cid,
-            ui_error("Не удалось получить список пользователей.", "повтори запрос"),
+            error_card("Не удалось получить список пользователей.", "повтори запрос"),
             context=context,
             parse_mode=ParseMode.HTML,
             force_new=True,
@@ -3347,6 +3457,7 @@ async def run_user_delete_list(bot, cid: int, *, context: ContextTypes.DEFAULT_T
         title="Удаление клиента",
         cb_prefix="delask",
         button_prefix="🗑 ",
+        button_style="danger",
         empty_hint="добавь пользователя перед удалением",
         too_long_title="Удаление через кнопки недоступно.",
         too_long_hint=f"сократи username (макс. {MAX_USERNAME_LEN} символов)",
@@ -3359,22 +3470,29 @@ def _apply_rotate_password_sync(
 ) -> tuple[str | None, tuple[str, str, bytes] | None]:
     """(ошибка, (username, deeplink, png)); при успехе первая часть None."""
     try:
+        _, old_text = _load_credentials_doc()
+    except RuntimeError as e:
+        return str(e), None
+    try:
         changed = rotate_user_password(username, password)
     except ValueError as e:
         return str(e), None
     if not changed:
         return f"Пользователь '{username}' не найден.", None
-    apply_tt_config_change()
-    prefix, proto = _export_context_for_username(username)
-    deeplink = generate_deeplink(username, client_random_prefix=prefix, protocol=proto)
+    try:
+        apply_tt_config_change()
+    except Exception:
+        _atomic_write_credentials(old_text, old_text)
+        raise
+    prefix, _ = _export_context_for_username(username)
+    deeplink = generate_deeplink(username, client_random_prefix=prefix)
     png = deeplink_qr_png(deeplink)
     return None, (username, deeplink, png)
 
 
-def _export_bundle_sync(username: str, protocol: str | None = None) -> tuple[str, bytes]:
-    prefix, prof_proto = _export_context_for_username(username)
-    proto = protocol if protocol in ("h2", "quic") else prof_proto
-    deeplink = generate_deeplink(username, client_random_prefix=prefix, protocol=proto)
+def _export_bundle_sync(username: str) -> tuple[str, bytes]:
+    prefix, _ = _export_context_for_username(username)
+    deeplink = generate_deeplink(username, client_random_prefix=prefix)
     return deeplink, deeplink_qr_png(deeplink)
 
 
@@ -3383,7 +3501,7 @@ def _export_toml_bundle_sync(
 ) -> tuple[str, bytes]:
     existing_prefix = _prefix_for_username(username)
     client_prefix = existing_prefix if (random_prefix and existing_prefix) else None
-    dns_upstreams = _protocol_dns_values(protocol)
+    dns_upstreams = _protocol_dns_values()
     text = generate_toml_config(
         username,
         client_random_prefix=client_prefix,
@@ -3399,15 +3517,34 @@ def _export_toml_bundle_sync(
     return filename, text.encode("utf-8")
 
 
-def _add_user_bundle_sync(
-    username: str, password: str, random_prefix: bool, protocol: str
-) -> tuple[str, bytes]:
-    deeplink = add_user_and_make_link(username, password, random_prefix=random_prefix, protocol=protocol)
+def _add_user_bundle_sync(username: str, password: str, random_prefix: bool) -> tuple[str, bytes]:
+    deeplink = add_user_and_make_link(username, password, random_prefix=random_prefix)
     return deeplink, deeplink_qr_png(deeplink)
 
 
+def _snapshot_tt_files(paths: list[Path]) -> dict[Path, tuple[str, int] | None]:
+    return {
+        p: (p.read_text(encoding="utf-8"), p.stat().st_mode & 0o777) if p.exists() else None
+        for p in paths
+    }
+
+
+def _restore_tt_files(snapshot: dict[Path, tuple[str, int] | None]) -> None:
+    for p, saved in snapshot.items():
+        if saved is None:
+            p.unlink(missing_ok=True)
+        else:
+            text, mode = saved
+            _atomic_write_bytes(p, text.encode("utf-8"), mode=mode)
+
+
 def _delete_user_and_restart_sync(username: str) -> tuple[bool, int]:
-    """Удаляет пользователя; возвращает (ok, число снятых allow-правил)."""
+    """Удаляет пользователя; возвращает (ok, число снятых allow-правил).
+
+    Если apply_tt_config_change упадёт после того как все 4 хранилища
+    (credentials/profiles/prefix-map/rules) уже изменены — откатываем все.
+    """
+    snapshot = _snapshot_tt_files([CRED_FILE, USER_PROFILES_FILE, PREFIX_MAP_FILE, RULES_FILE])
     if not delete_user(username):
         return False, 0
     had_prefix_profile = bool(_get_user_profile(username).get("random_prefix"))
@@ -3431,7 +3568,11 @@ def _delete_user_and_restart_sync(username: str) -> tuple[bool, int]:
         )
     auto_removed_rules, _ = _auto_cleanup_rules_orphans()
     rules_removed += len(auto_removed_rules)
-    apply_tt_config_change()
+    try:
+        apply_tt_config_change()
+    except Exception:
+        _restore_tt_files(snapshot)
+        raise
     return True, rules_removed
 
 
@@ -3492,14 +3633,14 @@ def _tt_start_best_effort() -> None:
 async def run_backup(bot, cid: int, *, context: ContextTypes.DEFAULT_TYPE | None = None) -> None:
     # Занятость уже проверена вызывающим (backup_confirm_callback, через
     # _reject_if_busy) — единственный caller этой функции.
-    await send_ui_card(bot, cid, ui_step("Бэкап конфигов", 1, 2, "Архивирую файлы…"), context=context, parse_mode=ParseMode.HTML)
+    await send_ui_card(bot, cid, step_card("Бэкап конфигов", 1, 2, "Архивирую файлы…"), context=context, parse_mode=ParseMode.HTML)
     try:
         backup_path, included = await asyncio.to_thread(create_configs_backup)
         if not included:
             await send_ui_card(
                 bot,
                 cid,
-                ui_error("Файлы для бэкапа не найдены.", "проверь наличие vpn.toml/hosts.toml/credentials.toml"),
+                error_card("Файлы для бэкапа не найдены.", "проверь наличие vpn.toml/hosts.toml/credentials.toml"),
                 context=context,
                 parse_mode=ParseMode.HTML,
                 reply_markup=hub_inline_kb(),
@@ -3520,7 +3661,7 @@ async def run_backup(bot, cid: int, *, context: ContextTypes.DEFAULT_TYPE | None
         await send_ui_card(
             bot,
             cid,
-            ui_error("Не удалось создать бэкап.", "проверь права на /opt/trusttunnel/backup и повтори"),
+            error_card("Не удалось создать бэкап.", "проверь права на /opt/trusttunnel/backup и повтори"),
             context=context,
             parse_mode=ParseMode.HTML,
             reply_markup=hub_inline_kb(),
@@ -3544,7 +3685,7 @@ async def run_restore_pick(bot, cid: int, *, context: ContextTypes.DEFAULT_TYPE 
         await send_ui_card(
             bot,
             cid,
-            ui_error("Бэкап не найден или пуст.", "сначала сделай «💾 Бэкап»"),
+            error_card("Бэкап не найден или пуст.", "сначала сделай «💾 Бэкап»"),
             context=context,
             parse_mode=ParseMode.HTML,
             reply_markup=hub_inline_kb(),
@@ -3632,9 +3773,7 @@ async def _edit_task_card(bot, cid: int, msg_id: int, text: str, *, kb=None) -> 
 
 
 async def run_os_upgrade(bot, cid: int, *, context: ContextTypes.DEFAULT_TYPE | None = None) -> None:
-    # Занятость уже проверена вызывающим (srv_callback, через _reject_if_busy) —
-    # единственный caller этой функции, в отличие от backup/restore/reboot/ttupd
-    # у неё нет отдельного confirm-шага со своим CallbackRoute.
+    # Занятость уже проверена вызывающим (os_upgrade_callback, через _reject_if_busy).
     busy_set("обновление ОС")
     started_text = (
         "⏳ <b>Обновление ОС</b> запущено.\n"
@@ -3708,7 +3847,7 @@ def _fetch_tt_versions() -> tuple[str, str]:
 
 
 async def run_tt_upgrade_flow(bot, cid: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await send_ui_card(bot, cid, ui_step("Обновление TrustTunnel", 1, 4, "Проверяю версии на GitHub…"), context=context, parse_mode=ParseMode.HTML)
+    await send_ui_card(bot, cid, step_card("Обновление TrustTunnel", 1, 4, "Проверяю версии на GitHub…"), context=context, parse_mode=ParseMode.HTML)
     try:
         current, latest = await asyncio.to_thread(_fetch_tt_versions)
 
@@ -3742,7 +3881,7 @@ async def run_tt_upgrade_flow(bot, cid: int, context: ContextTypes.DEFAULT_TYPE)
         await send_ui_card(
             bot,
             cid,
-            ui_error("Не удалось проверить версию на GitHub.", "проверь сеть/API и повтори"),
+            error_card("Не удалось проверить версию на GitHub.", "проверь сеть/API и повтори"),
             context=context,
             parse_mode=ParseMode.HTML,
             reply_markup=hub_inline_kb(),
@@ -3752,7 +3891,7 @@ async def run_tt_upgrade_flow(bot, cid: int, context: ContextTypes.DEFAULT_TYPE)
         await send_ui_card(
             bot,
             cid,
-            ui_error("Не удалось проверить версию TrustTunnel.", "проверь логи tt-bot и повтори"),
+            error_card("Не удалось проверить версию TrustTunnel.", "проверь логи tt-bot и повтори"),
             context=context,
             parse_mode=ParseMode.HTML,
             reply_markup=hub_inline_kb(),
@@ -3765,7 +3904,7 @@ async def run_os_upgrade_confirm(bot, cid: int, *, context: ContextTypes.DEFAULT
         cid,
         "<b>🆙 Обновление ОС</b>\nМожет обновить ядро/системные библиотеки. Продолжить?",
         context=context,
-        reply_markup=confirm_kb("osupd_yes", "osupd_no"),
+        reply_markup=confirm_kb("osupd_yes", "osupd_no", danger=True),
         parse_mode=ParseMode.HTML,
     )
 
@@ -3776,7 +3915,7 @@ async def run_reboot_confirm(bot, cid: int, *, context: ContextTypes.DEFAULT_TYP
         cid,
         "<b>🔁 Перезагрузка сервера</b>\nПродолжить?",
         context=context,
-        reply_markup=confirm_kb("rbdo", "rbcancel"),
+        reply_markup=confirm_kb("rbdo", "rbcancel", danger=True),
         parse_mode=ParseMode.HTML,
     )
 
@@ -3889,7 +4028,10 @@ async def ui_open_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("ul:"):
+    if not q:
+        return
+    data = q.data or ""
+    if not data.startswith("ul:"):
         return
     await cb_answer(q)
     try:
@@ -3918,7 +4060,10 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def users_filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("uf:"):
+    if not q:
+        return
+    data = q.data or ""
+    if not data.startswith("uf:"):
         return
     await cb_answer(q)
     filter_mode = _normalize_users_filter((q.data or "uf:all").split(":", 1)[1])
@@ -3957,14 +4102,17 @@ def _render_user_detail_text(username: str) -> str:
 
 async def user_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("udev:"):
+    if not q:
+        return
+    data = q.data or ""
+    if not data.startswith("udev:"):
         return
     await cb_answer(q)
     clear_rotate_wait(context)
     # Промпт ротации сейчас переиспользуется (edit) под карточку пользователя —
     # он не сгорает, просто перестаёт быть «висящим» сообщением ротации.
     _untrack_scaffold(context, ROTATE_SCAFFOLD_KEY, _accessible(q.message))
-    username = (q.data or "").split(":", 1)[1]
+    username = data.split(":", 1)[1]
     try:
         if username not in await asyncio.to_thread(list_usernames):
             await safe_edit_message_text(
@@ -3985,16 +4133,16 @@ async def user_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         logger.exception("User detail failed")
         await safe_edit_message_text(
             q,
-            ui_error("Не удалось показать карточку пользователя.", "проверь credentials.toml"),
+            error_card("Не удалось показать карточку пользователя.", "проверь credentials.toml"),
             parse_mode=ParseMode.HTML,
             reply_markup=merge_inline_kb(card_footer_row("user")),
         )
 
 
 async def _send_user_qr(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, username: str, action_label: str) -> None:
-    prefix, proto = _export_context_for_username(username)
+    prefix, proto = await asyncio.to_thread(_export_context_for_username, username)
     async with CRED_LOCK:
-        deeplink, png = await asyncio.to_thread(_export_bundle_sync, username, proto)
+        deeplink, png = await asyncio.to_thread(_export_bundle_sync, username)
     msg = _accessible(q.message)
     if not msg:
         return
@@ -4012,7 +4160,7 @@ async def _send_user_qr(q: CallbackQuery, context: ContextTypes.DEFAULT_TYPE, us
     )
 
 
-async def user_quick_qr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def user_action_qr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
         return
@@ -4029,20 +4177,24 @@ async def user_quick_qr_callback(update: Update, context: ContextTypes.DEFAULT_T
         await send_inline_message(context.bot, _chat_id(update), "Ошибка. Не удалось выдать QR.")
 
 
-async def user_quick_toml_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def user_action_toml_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("utc:"):
+    if not q:
+        return
+    data = q.data or ""
+    if not data.startswith("utc:"):
         return
     await cb_answer(q, "TOML…")
-    username = (q.data or "").split(":", 1)[1]
-    if username not in await asyncio.to_thread(list_usernames):
+    username = data.split(":", 1)[1]
+    try:
+        known = await asyncio.to_thread(list_usernames)
+    except ValueError:
+        await cb_answer(q, "credentials.toml повреждён", alert=True)
+        return
+    if username not in known:
         await cb_answer(q, "Пользователь не найден", alert=True)
         return
-    prof = await asyncio.to_thread(_get_user_profile, username)
-    protocol = str(prof.get("protocol", "h2"))
-    if protocol not in ("h2", "quic"):
-        protocol = "h2"
-    random_prefix = bool(prof.get("random_prefix"))
+    protocol, random_prefix = await _load_export_profile(username)
     try:
         async with CRED_LOCK:
             filename, payload = await asyncio.to_thread(
@@ -4062,13 +4214,21 @@ async def user_quick_toml_callback(update: Update, context: ContextTypes.DEFAULT
         await send_inline_message(context.bot, _chat_id(update), "Ошибка. Не удалось отправить TOML.")
 
 
-async def user_quick_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def user_action_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("ulink:"):
+    if not q:
+        return
+    data = q.data or ""
+    if not data.startswith("ulink:"):
         return
     await cb_answer(q, "Ссылка…")
-    username = (q.data or "").split(":", 1)[1]
-    if username not in await asyncio.to_thread(list_usernames):
+    username = data.split(":", 1)[1]
+    try:
+        known = await asyncio.to_thread(list_usernames)
+    except ValueError:
+        await cb_answer(q, "credentials.toml повреждён", alert=True)
+        return
+    if username not in known:
         await cb_answer(q, "Пользователь не найден", alert=True)
         return
     try:
@@ -4092,23 +4252,27 @@ async def user_quick_link_callback(update: Update, context: ContextTypes.DEFAULT
         await send_inline_message(context.bot, _chat_id(update), "Ошибка. Не удалось отправить ссылку.")
 
 
-async def user_quick_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def user_action_all_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("uall:"):
+    if not q:
+        return
+    data = q.data or ""
+    if not data.startswith("uall:"):
         return
     await cb_answer(q, "Готовлю…")
-    username = (q.data or "").split(":", 1)[1]
-    if username not in await asyncio.to_thread(list_usernames):
+    username = data.split(":", 1)[1]
+    try:
+        known = await asyncio.to_thread(list_usernames)
+    except ValueError:
+        await cb_answer(q, "credentials.toml повреждён", alert=True)
+        return
+    if username not in known:
         await cb_answer(q, "Пользователь не найден", alert=True)
         return
-    prof = await asyncio.to_thread(_get_user_profile, username)
-    protocol = str(prof.get("protocol", "h2"))
-    if protocol not in ("h2", "quic"):
-        protocol = "h2"
-    random_prefix = bool(prof.get("random_prefix"))
+    protocol, random_prefix = await _load_export_profile(username)
     try:
         async with CRED_LOCK:
-            deeplink, png = await asyncio.to_thread(_export_bundle_sync, username, protocol)
+            deeplink, png = await asyncio.to_thread(_export_bundle_sync, username)
             filename, payload = await asyncio.to_thread(
                 _export_toml_bundle_sync, username, protocol, random_prefix
             )
@@ -4146,12 +4310,15 @@ async def user_quick_all_callback(update: Update, context: ContextTypes.DEFAULT_
         await send_inline_message(context.bot, _chat_id(update), "Ошибка. Не удалось отправить комплект.")
 
 
-async def user_quick_rotate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def user_action_rotate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("urot:"):
+    if not q:
+        return
+    data = q.data or ""
+    if not data.startswith("urot:"):
         return
     await cb_answer(q)
-    username = (q.data or "").split(":", 1)[1]
+    username = data.split(":", 1)[1]
     begin_rotate_password_wait(context, username)
     # Только один промпт ротации живёт за раз — начало новой ротации сжигает
     # предыдущий, а не оставляет его висеть в чате.
@@ -4167,12 +4334,15 @@ async def user_quick_rotate_callback(update: Update, context: ContextTypes.DEFAU
     await _delete_callback_source_quiet(q)
 
 
-async def user_quick_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def user_action_del_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("udel:"):
+    if not q:
+        return
+    data = q.data or ""
+    if not data.startswith("udel:"):
         return
     await cb_answer(q)
-    username = (q.data or "").split(":", 1)[1]
+    username = data.split(":", 1)[1]
     await safe_edit_message_text(
         q,
         delete_user_confirm_text(username),
@@ -4194,9 +4364,12 @@ def rules_sync_inline_kb() -> InlineKeyboardMarkup:
 
 async def rules_sync_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("rulesync:"):
+    if not q:
         return
-    mode = (q.data or "").split(":", 1)[1]
+    data = q.data or ""
+    if not data.startswith("rulesync:"):
+        return
+    mode = data.split(":", 1)[1]
     if mode == "repair":
         await cb_answer(q, "Чиню rules…")
         try:
@@ -4258,9 +4431,11 @@ async def rules_sync_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("nav:"):
+    if not q:
         return
     data = q.data or ""
+    if not data.startswith("nav:"):
+        return
     cid = _chat_id(update)
     msg = _accessible(q.message)
     await reset_nav_state(context)
@@ -4294,7 +4469,7 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "nav:info":
         await cb_answer(q)
-        await run_infosrv(context.bot, cid, edit_message=msg)
+        await run_info_card(context.bot, cid, edit_message=msg)
         return
 
     if data == "nav:clients":
@@ -4333,7 +4508,7 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.exception("nav users failed")
             await safe_edit_message_text(
                 q,
-                ui_error("Не удалось показать список пользователей.", "проверь credentials.toml и попробуй ещё раз"),
+                error_card("Не удалось показать список пользователей.", "проверь credentials.toml и попробуй ещё раз"),
                 parse_mode=ParseMode.HTML,
                 reply_markup=vpn_hub_kb(),
             )
@@ -4365,13 +4540,16 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def srv_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("srv:"):
+    if not q:
         return
-    action = (q.data or "").split(":", 1)[1]
+    data = q.data or ""
+    if not data.startswith("srv:"):
+        return
+    action = data.split(":", 1)[1]
     cid = _chat_id(update)
     await cb_answer(q)
     if action == "restart":
-        await tap_restart_tt(update, context)
+        await restart_tt_prompt_callback(update, context)
     elif action == "backup":
         await run_backup_confirm(context.bot, cid, context=context)
     elif action == "restore":
@@ -4386,9 +4564,12 @@ async def srv_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def vpn_hub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("vpn:"):
+    if not q:
         return
-    action = (q.data or "").split(":", 1)[1]
+    data = q.data or ""
+    if not data.startswith("vpn:"):
+        return
+    action = data.split(":", 1)[1]
     # vpn:add обрабатывает диалог добавления пользователя.
     cid = _chat_id(update)
     if action == "find":
@@ -4417,7 +4598,10 @@ async def vpn_hub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def copyhost_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or (q.data or "") != "copyhost:msg":
+    if not q:
+        return
+    data = q.data or ""
+    if data != "copyhost:msg":
         return
     await cb_answer(q)
     await send_inline_message(
@@ -4437,7 +4621,12 @@ async def user_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not username:
         await message.reply_text("Пустой username.")
         return
-    if username not in await asyncio.to_thread(list_usernames):
+    try:
+        known = await asyncio.to_thread(list_usernames)
+    except ValueError:
+        await message.reply_text("credentials.toml повреждён — проверь файл вручную.")
+        return
+    if username not in known:
         await message.reply_text(
             f"Пользователь <code>{html.escape(username)}</code> не найден.",
             parse_mode=ParseMode.HTML,
@@ -4453,16 +4642,19 @@ async def user_search_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def user_search_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or (q.data or "") != "searchcancel":
+    if not q:
+        return
+    data = q.data or ""
+    if data != "searchcancel":
         return
     await cb_answer(q, "Отменено")
     _ud(context).pop("pending_user_search", None)
     await _cleanup_user_search_scaffold(context.bot, context, current_message=_accessible(q.message))
 
 
-async def tap_restart_tt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def restart_tt_prompt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "<b>♻️ Перезапуск trusttunnel</b>\nПодтвердить перезапуск сервиса?"
-    kb = confirm_kb("ttrst_yes", "ttrst_no")
+    kb = confirm_kb("ttrst_yes", "ttrst_no", danger=True)
     await send_ui_card(context.bot, _chat_id(update), text, context=context, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
@@ -4526,7 +4718,8 @@ async def diff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     assert message is not None
     text = await asyncio.to_thread(_diff_against_latest_backup)
     await message.reply_text(
-        f"<pre>{html.escape(clip_text(text, 3500))}</pre>", parse_mode=ParseMode.HTML
+        f"<blockquote expandable><pre>{html.escape(clip_text(text, CLIP_TEXT_LIMIT_IN_BLOCKQUOTE))}</pre></blockquote>",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -4618,7 +4811,10 @@ async def _cleanup_rotate_scaffold(bot, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def add_entry_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or (q.data or "") != "vpn:add":
+    if not q:
+        return ConversationHandler.END
+    data = q.data or ""
+    if data != "vpn:add":
         return ConversationHandler.END
     await cb_answer(q)
     clear_all_pending_text_waits(context)
@@ -4637,7 +4833,10 @@ async def add_entry_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or (q.data or "") != "addcancel":
+    if not q:
+        return ASK_ADD_USERNAME
+    data = q.data or ""
+    if data != "addcancel":
         return ASK_ADD_USERNAME
     await cb_answer(q, "Отменено")
     _ud(context).pop("add_flow_active", None)
@@ -4719,7 +4918,6 @@ async def add_prefix_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     await cb_answer(q)
 
-
     data = q.data or ""
     if data not in ("addpref:on", "addpref:off", "addpref:cancel"):
         return ASK_ADD_PREFIX
@@ -4762,7 +4960,6 @@ async def add_protocol_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
     await cb_answer(q)
 
-
     data = q.data or ""
     if data not in ("addproto:h2", "addproto:quic", "addproto:cancel"):
         return ASK_ADD_PROTOCOL
@@ -4792,7 +4989,7 @@ async def add_protocol_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     protocol_label = _protocol_label(protocol)
     try:
         async with CRED_LOCK:
-            deeplink, png = await asyncio.to_thread(_add_user_bundle_sync, username, password, random_prefix, protocol)
+            deeplink, png = await asyncio.to_thread(_add_user_bundle_sync, username, password, random_prefix)
             await asyncio.to_thread(
                 _set_user_profile,
                 username,
@@ -4834,7 +5031,6 @@ async def add_protocol_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def rotate_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
 
-
     if not q:
         return
     await cb_answer(q)
@@ -4845,15 +5041,16 @@ async def rotate_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     username = data.split(":", 1)[1]
     begin_rotate_password_wait(context, username)
-    # Только один промпт ротации живёт за раз (см. user_quick_rotate_callback) —
-    # если до этого уже был открыт промпт для другого пользователя через
-    # карточку (urot:), он остаётся висеть в чате, хотя ротация уже переключилась.
+    # Сжигает промпт, оставшийся от urot: (см. user_action_rotate_callback).
     await _cleanup_rotate_scaffold(context.bot, context)
-    await q.edit_message_text(
+    await safe_edit_message_text(q,
         rotate_password_prompt_text(username),
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([card_footer_row("vpn")]),
     )
+    msg = _accessible(q.message)
+    if msg:
+        _ud(context).setdefault(ROTATE_SCAFFOLD_KEY, []).append((msg.chat_id, msg.message_id))
 
 
 async def rotate_password_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4904,7 +5101,6 @@ async def rotate_password_input(update: Update, context: ContextTypes.DEFAULT_TY
 async def export_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
 
-
     if not q:
         return
     await cb_answer(q)
@@ -4915,7 +5111,7 @@ async def export_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     username = data.split(":", 1)[1]
     kb = InlineKeyboardMarkup(_protocol_kb_rows(lambda p: f"expproto:{p}:{username}"))
-    await q.edit_message_text(
+    await safe_edit_message_text(q,
         "<b>📤 QR</b>\n"
         f"Пользователь: <code>{html.escape(username)}</code>\n"
         "Выбери протокол:",
@@ -4936,10 +5132,9 @@ async def export_protocol_callback(update: Update, context: ContextTypes.DEFAULT
         _, protocol, username = data.split(":", 2)
     except ValueError:
         return
-    if protocol not in ("h2", "quic"):
-        protocol = "h2"
+    protocol = _normalize_protocol(protocol)
     try:
-        deeplink, png = await asyncio.to_thread(_export_bundle_sync, username, protocol)
+        deeplink, png = await asyncio.to_thread(_export_bundle_sync, username)
         msg = _accessible(q.message)
         if msg:
             await reply_deeplink_with_qr(
@@ -4953,15 +5148,14 @@ async def export_protocol_callback(update: Update, context: ContextTypes.DEFAULT
                 delete_source=True,
             )
     except CommandError as e:
-        await q.edit_message_text(f"❌ {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        await best_effort_edit(q, f"❌ {html.escape(str(e))}", parse_mode=ParseMode.HTML)
     except Exception:
         logger.exception("Export user failed")
-        await q.edit_message_text("Ошибка. Не удалось экспортировать пользователя.")
+        await best_effort_edit(q, "Ошибка. Не удалось экспортировать пользователя.")
 
 
-def _protocol_dns_label(protocol: str) -> str:
+def _protocol_dns_label() -> str:
     # Подпись = реальные апстримы из _protocol_dns_values, одинаковые для обоих протоколов.
-    del protocol
     return "DoH + DoQ: AdGuard"
 
 
@@ -4978,9 +5172,7 @@ async def toml_export_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data.startswith("tc:"):
         username = data.split(":", 1)[1]
         profile = await asyncio.to_thread(_get_user_profile, username)
-        preferred = str(profile.get("protocol", "h2"))
-        if preferred not in ("h2", "quic"):
-            preferred = "h2"
+        preferred = _normalize_protocol(str(profile.get("protocol", "h2")))
         kb = InlineKeyboardMarkup(_protocol_kb_rows(lambda p: f"tp:{p}:{username}"))
         await send_inline_message(
             context.bot,
@@ -5001,11 +5193,10 @@ async def toml_export_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         _, protocol, username = data.split(":", 2)
     except ValueError:
         return
-    if protocol not in ("h2", "quic"):
-        protocol = "h2"
-    prof = _get_user_profile(username)
+    protocol = _normalize_protocol(protocol)
+    prof = await asyncio.to_thread(_get_user_profile, username)
     random_prefix = bool(prof.get("random_prefix", False))
-    await q.edit_message_text("⏳ Готовлю TOML-файл…")
+    await safe_edit_message_text(q, "⏳ Готовлю TOML-файл…")
     try:
         async with CRED_LOCK:
             filename, payload = await asyncio.to_thread(_export_toml_bundle_sync, username, protocol, random_prefix)
@@ -5016,16 +5207,16 @@ async def toml_export_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 "<b>TOML экспорт</b>\n"
                 f"Пользователь: <code>{html.escape(username)}</code>\n"
                 f"Протокол: <code>{html.escape(_protocol_label(protocol))}</code>\n"
-                f"DNS: <code>{html.escape(_protocol_dns_label(protocol))}</code>"
+                f"DNS: <code>{html.escape(_protocol_dns_label())}</code>"
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=toml_share_kb(username),
             disable_notification=True,
         )
-        await q.edit_message_text("TOML-файл отправлен.")
+        await safe_edit_message_text(q, "TOML-файл отправлен.")
     except Exception as e:
         logger.exception("TOML export failed")
-        await q.edit_message_text(f"❌ Не удалось сформировать TOML.\n<code>{html.escape(str(e)[:300])}</code>", parse_mode=ParseMode.HTML)
+        await best_effort_edit(q, f"❌ Не удалось сформировать TOML.\n<code>{html.escape(str(e)[:300])}</code>", parse_mode=ParseMode.HTML)
 
 
 # Monitoring callbacks
@@ -5038,7 +5229,7 @@ async def info_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TY
     await cb_answer(q, "Обновлено")
     try:
         text = await asyncio.to_thread(get_info_card_html_cached)
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             clip_text(text),
             parse_mode=ParseMode.HTML,
             reply_markup=info_card_inline_kb(),
@@ -5047,56 +5238,31 @@ async def info_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TY
         logger.exception("info refresh failed")
 
 
-async def cert_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or q.data != "certr":
-        return
-    await cb_answer(q, "Обновлено")
-    try:
-        text, _ = await asyncio.to_thread(cached_compute, "cert_card", MONITOR_CACHE_TTL_SEC, get_cert_card_data)
-        kb = cert_card_inline_kb()
-        await q.edit_message_text(
-            clip_text(text),
-            parse_mode=ParseMode.HTML,
-            reply_markup=kb,
-        )
-    except Exception:
-        logger.exception("cert refresh failed")
-
-
 def get_certbot_log_tail(lines: int = 20) -> str:
     if not LE_LOG_FILE.exists():
-        return f"Файл лога не найден: {LE_LOG_FILE}"
+        return f"Файл лога не найден: {html.escape(str(LE_LOG_FILE))}"
     try:
         p = run_process(["tail", "-n", str(max(20, lines * 4)), str(LE_LOG_FILE)], timeout=15, check=False)
         code, out, err = p.returncode, p.stdout.strip(), p.stderr.strip()
     except CommandError as e:
         code, out, err = 124, "", str(e)
     if code != 0:
-        return f"Не удалось прочитать лог certbot.\n{err or out}"
+        return f"Не удалось прочитать лог certbot.\n{html.escape(err or out)}"
     rows = (out or "").splitlines()
     snippet = "\n".join(rows[-lines:]) if rows else "Пусто."
-    return f"🧾 Лог certbot · последние {lines}\n\n{snippet}"
-
-
-def _renew_cert_sync() -> tuple[bool, str]:
-    if not CERT_RENEW_SCRIPT.exists():
-        return False, f"Скрипт не найден: {CERT_RENEW_SCRIPT}"
-    try:
-        run_process(["bash", str(CERT_RENEW_SCRIPT), "--force"], timeout=2400, retries=0, check=True)
-        try:
-            mode = apply_tt_config_change(reload_tls=True)
-            state = run_cmd(["systemctl", "is-active", SERVICE_NAME]) or "unknown"
-            return True, f"{state} ({mode})"
-        except CommandError as e:
-            return False, str(e)
-    except CommandError as e:
-        return False, str(e)
+    snippet = snippet[:CLIP_TEXT_LIMIT_IN_BLOCKQUOTE]
+    return (
+        f"🧾 Лог certbot · последние {lines}\n\n"
+        f"<blockquote expandable>{html.escape(snippet)}</blockquote>"
+    )
 
 
 async def cert_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("certlog:"):
+    if not q:
+        return
+    data = q.data or ""
+    if not data.startswith("certlog:"):
         return
     try:
         lines = int((q.data or "certlog:20").split(":", 1)[1])
@@ -5112,104 +5278,21 @@ async def cert_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     InlineKeyboardButton("20", callback_data="certlog:20"),
                     InlineKeyboardButton("50", callback_data="certlog:50"),
                 ],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="certr")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="nav:cert", style="success")],
             ]
         )
-        await q.edit_message_text(clip_text(text), reply_markup=kb)
+        await safe_edit_message_text(q, clip_text(text), parse_mode=ParseMode.HTML, reply_markup=kb)
     except Exception:
         logger.exception("cert log callback failed")
 
 
-async def _cert_renew_task(bot, cid: int, msg_id: int) -> None:
-    try:
-        async with _typing_while(bot, cid):
-            ok, info = await asyncio.to_thread(_renew_cert_sync)
-            invalidate_monitor_cache("cert_card")
-            if not ok:
-                await _edit_task_card(
-                    bot,
-                    cid,
-                    msg_id,
-                    f"❌ Не удалось обновить сертификат.\n<code>{html.escape(info[:700])}</code>",
-                    kb=cert_card_inline_kb(),
-                )
-                return
-            text, _ = await asyncio.to_thread(
-                cached_compute, "cert_card", MONITOR_CACHE_TTL_SEC, get_cert_card_data
-            )
-            await _edit_task_card(
-                bot,
-                cid,
-                msg_id,
-                "Действие: <code>обновление сертификата</code>\n"
-                f"Сервис: <code>{html.escape(info)}</code>\n\n"
-                f"{clip_text(text, 2600)}",
-                kb=cert_card_inline_kb(),
-            )
-    except Exception:
-        logger.exception("cert renew task failed")
-        await _edit_task_card(
-            bot,
-            cid,
-            msg_id,
-            "❌ Не удалось обновить сертификат. Проверь journalctl -u tt-bot.",
-            kb=cert_card_inline_kb(),
-        )
-    finally:
-        busy_clear()
-
-
-async def cert_update_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q or not (q.data or "").startswith("certupd:"):
-        return
-    mode = (q.data or "").split(":", 1)[1]
-    if mode == "ask":
-        await cb_answer(q)
-        await q.edit_message_text(
-            "<b>Обновление TrustTunnel</b>\n"
-            "Запустить <code>certbot renew</code> + restart trusttunnel?",
-            parse_mode=ParseMode.HTML,
-            reply_markup=confirm_kb("certupd:do", "certupd:cancel"),
-        )
-        return
-    if mode == "cancel":
-        await cb_answer(q, "Отменено")
-        await q.edit_message_text("Обновление сертификата отменено.")
-        return
-    if mode != "do":
-        return
-
-    if await _reject_if_busy(update):
-        return
-    msg = q.message
-    if not msg:
-        return
-
-    invalidate_monitor_cache("cert_card")
-    busy_set("обновление сертификата")
-    try:
-        await cb_answer(q, "Запуск renew…", alert=True)
-        await q.edit_message_text(
-            "⏳ <b>Обновление сертификата</b> запущено.\n"
-            "<i>Операция идёт в фоне, меню работает.</i>",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception:
-        busy_clear()
-        logger.exception("Не удалось запустить обновление сертификата")
-        return
-    _schedule_background_task(
-        context,
-        _cert_renew_task(context.bot, _chat_id(update), msg.message_id),
-    )
-
-
 async def clients_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("ss:"):
+    if not q:
         return
     data = q.data or ""
+    if not data.startswith("ss:"):
+        return
     await cb_answer(q)
     try:
         page = int(data[3:])
@@ -5231,9 +5314,11 @@ async def clients_page_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def logs_filter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not (q.data or "").startswith("logf:"):
+    if not q:
         return
     data = q.data or ""
+    if not data.startswith("logf:"):
+        return
     if data == "logf:noop:50:0":
         await cb_answer(q)
         return
@@ -5253,7 +5338,7 @@ async def logs_filter_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         text, chunk, total_chunks = await asyncio.to_thread(build_logs_view, level, lines, chunk)
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             clip_text(text),
             reply_markup=logs_inline_kb(level, lines, chunk, total_chunks),
         )
@@ -5271,7 +5356,7 @@ async def backup_confirm_callback(update: Update, context: ContextTypes.DEFAULT_
         return
     if data == "bak:no":
         await cb_answer(q, "Отменено")
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             text=UI_OPEN_SERVER,
             parse_mode=ParseMode.HTML,
             reply_markup=server_hub_kb(),
@@ -5293,17 +5378,17 @@ async def restart_tt_confirm_callback(update: Update, context: ContextTypes.DEFA
         return
     if data == "ttrst_no":
         await cb_answer(q, "Отменено")
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             "Перезапуск <b>trusttunnel</b> отменён.",
             parse_mode=ParseMode.HTML,
             reply_markup=hub_inline_kb(),
         )
         return
     await cb_answer(q, "Перезапуск…", alert=True)
-    await q.edit_message_text("⏳ Перезапускаю <b>trusttunnel</b>…", parse_mode=ParseMode.HTML)
+    await safe_edit_message_text(q, "⏳ Перезапускаю <b>trusttunnel</b>…", parse_mode=ParseMode.HTML)
     try:
         await asyncio.to_thread(apply_tt_config_change)
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             "Действие: <code>перезапуск</code>\n"
             "Сервис: <code>trusttunnel active</code>",
             parse_mode=ParseMode.HTML,
@@ -5311,7 +5396,7 @@ async def restart_tt_confirm_callback(update: Update, context: ContextTypes.DEFA
         )
     except Exception:
         logger.exception("Restart failed")
-        await q.edit_message_text(
+        await best_effort_edit(q,
             "❌ Не удалось перезапустить сервис.",
             parse_mode=ParseMode.HTML,
             reply_markup=hub_inline_kb(),
@@ -5343,13 +5428,12 @@ async def _undo_delete_user(q, payload: dict[str, Any]) -> None:
                 username,
                 payload["password"],
                 random_prefix=payload.get("random_prefix", False),
-                protocol=payload.get("protocol"),
             )
     except ValueError as e:
         await cb_answer(q, str(e), alert=True)
         return
     await cb_answer(q, "Пользователь восстановлен", alert=True)
-    await q.edit_message_text(
+    await safe_edit_message_text(q,
         f"↩️ Пользователь <code>{html.escape(username)}</code> восстановлен.",
         parse_mode=ParseMode.HTML,
         reply_markup=hub_inline_kb(),
@@ -5362,7 +5446,7 @@ async def _undo_restore_file(q, payload: dict[str, Any]) -> None:
         await asyncio.to_thread(_atomic_write_bytes, TT_DIR / filename, payload["data"], mode=payload.get("mode"))
     await asyncio.to_thread(apply_tt_config_change)
     await cb_answer(q, "Восстановлено обратно", alert=True)
-    await q.edit_message_text(
+    await safe_edit_message_text(q,
         f"↩️ <code>{html.escape(filename)}</code> возвращён к состоянию до восстановления.",
         parse_mode=ParseMode.HTML,
         reply_markup=hub_inline_kb(),
@@ -5378,7 +5462,10 @@ _UNDO_HANDLERS = {
 
 async def undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or (q.data or "") != "undo:go":
+    if not q:
+        return
+    data = q.data or ""
+    if data != "undo:go":
         return
     info = _pop_pending_undo(context)
     if not info:
@@ -5412,7 +5499,7 @@ async def delete_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data.startswith("delask:"):
         await cb_answer(q)
         username = data.split(":", 1)[1]
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             delete_user_confirm_text(username),
             reply_markup=delete_user_confirm_kb(username),
             parse_mode=ParseMode.HTML,
@@ -5422,10 +5509,10 @@ async def delete_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data.startswith("del2:"):
         await cb_answer(q)
         username = data.split(":", 1)[1]
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             "<b>Удаление</b> · шаг 2/2\n"
             f"Удалить <code>{html.escape(username)}</code> и перезапустить сервис?",
-            reply_markup=confirm_kb(f"deldo:{username}", f"delcancel:{username}"),
+            reply_markup=confirm_kb(f"deldo:{username}", f"delcancel:{username}", danger=True),
             parse_mode=ParseMode.HTML,
         )
         return
@@ -5433,13 +5520,13 @@ async def delete_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data.startswith("delcancel:"):
         await cb_answer(q, "Отменено")
         username = data.split(":", 1)[1]
-        await q.edit_message_text(f"Удаление <code>{html.escape(username)}</code> отменено.", parse_mode=ParseMode.HTML)
+        await safe_edit_message_text(q, f"Удаление <code>{html.escape(username)}</code> отменено.", parse_mode=ParseMode.HTML)
         return
 
     if data.startswith("deldo:"):
         username = data.split(":", 1)[1]
         await cb_answer(q, "Удаляю…", alert=True)
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             f"Удаляю <code>{html.escape(username)}</code> и перезапускаю сервис… ⏳",
             parse_mode=ParseMode.HTML,
         )
@@ -5449,7 +5536,7 @@ async def delete_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 prof = await asyncio.to_thread(_get_user_profile, username)
                 ok, rules_removed = await asyncio.to_thread(_delete_user_and_restart_sync, username)
             if not ok:
-                await q.edit_message_text(
+                await safe_edit_message_text(q,
                     f"Пользователь <code>{html.escape(username)}</code> не найден.",
                     parse_mode=ParseMode.HTML,
                     reply_markup=hub_inline_kb(),
@@ -5468,12 +5555,11 @@ async def delete_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     {
                         "username": username,
                         "password": old_password,
-                        "protocol": prof.get("protocol"),
                         "random_prefix": bool(prof.get("random_prefix")),
                     },
                 )
                 kb = _with_undo_row(kb)
-            await q.edit_message_text(
+            await safe_edit_message_text(q,
                 f"Действие: <code>удаление</code>\n"
                 f"Пользователь: <code>{html.escape(username)}</code>"
                 f"{prefix_note}\n"
@@ -5482,16 +5568,16 @@ async def delete_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_markup=kb,
             )
         except ValueError as e:
-            await q.edit_message_text(
+            await best_effort_edit(q,
                 f"⚠️ {html.escape(str(e))}", parse_mode=ParseMode.HTML, reply_markup=hub_inline_kb()
             )
         except CommandError as e:
-            await q.edit_message_text(
+            await best_effort_edit(q,
                 f"❌ {html.escape(str(e))}", parse_mode=ParseMode.HTML, reply_markup=hub_inline_kb()
             )
         except Exception:
             logger.exception("Delete user failed")
-            await q.edit_message_text(
+            await best_effort_edit(q,
                 "Ошибка. Не удалось удалить пользователя.", reply_markup=hub_inline_kb()
             )
 
@@ -5517,7 +5603,7 @@ async def restore_backup_callback(update: Update, context: ContextTypes.DEFAULT_
                 [InlineKeyboardButton("❌ Отмена", callback_data="rescancel:menu")],
             ]
         )
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             "<b>Подтверждение восстановления</b>\n"
             f"Выбор: <code>{html.escape(label)}</code>\n"
             "Будет взят из latest-configs.tar.gz,\n"
@@ -5533,17 +5619,17 @@ async def restore_backup_callback(update: Update, context: ContextTypes.DEFAULT_
         prev_data: bytes | None = None
         prev_mode: int | None = None
         if filename == "__all__":
-            await q.edit_message_text("⏳ Восстанавливаю <code>все файлы</code>…", parse_mode=ParseMode.HTML)
+            await safe_edit_message_text(q, "⏳ Восстанавливаю <code>все файлы</code>…", parse_mode=ParseMode.HTML)
             files = await asyncio.to_thread(list_files_in_latest_backup)
             async with CRED_LOCK:
                 ok, info = await asyncio.to_thread(restore_multiple_from_latest_backup, files)
         else:
-            await q.edit_message_text(f"⏳ Восстанавливаю <code>{html.escape(filename)}</code>…", parse_mode=ParseMode.HTML)
+            await safe_edit_message_text(q, f"⏳ Восстанавливаю <code>{html.escape(filename)}</code>…", parse_mode=ParseMode.HTML)
             prev_data, prev_mode = await asyncio.to_thread(_read_file_snapshot, TT_DIR / filename)
             async with CRED_LOCK:
                 ok, info = await asyncio.to_thread(restore_file_from_latest_backup, filename)
         if not ok:
-            await q.edit_message_text(
+            await safe_edit_message_text(q,
                 f"❌ {html.escape(info)}", parse_mode=ParseMode.HTML, reply_markup=hub_inline_kb()
             )
             return
@@ -5557,7 +5643,7 @@ async def restore_backup_callback(update: Update, context: ContextTypes.DEFAULT_
         if prev_data is not None:
             _set_pending_undo(context, "restore_file", {"filename": filename, "data": prev_data, "mode": prev_mode})
             kb = _with_undo_row(kb)
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             "Действие: <code>восстановление из бэкапа</code>\n"
             f"Файл: <code>{html.escape(restored_label)}</code>\n"
             f"Сервис: <code>{html.escape(svc)}</code>",
@@ -5567,7 +5653,7 @@ async def restore_backup_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if data.startswith("rescancel:"):
-        await q.edit_message_text("Восстановление отменено.", reply_markup=hub_inline_kb())
+        await safe_edit_message_text(q, "Восстановление отменено.", reply_markup=hub_inline_kb())
 
 
 # TrustTunnel update callbacks
@@ -5583,7 +5669,7 @@ async def _tt_upgrade_task(bot, cid: int, msg_id: int, pending: dict[str, str]) 
             code, out, err = await asyncio.to_thread(_tt_install_sync, pending["latest"])
             if code != 0:
                 await asyncio.to_thread(_restore_tt_binary_backup)
-                _tt_start_best_effort()
+                await asyncio.to_thread(_tt_start_best_effort)
                 await _edit_task_card(
                     bot,
                     cid,
@@ -5600,7 +5686,7 @@ async def _tt_upgrade_task(bot, cid: int, msg_id: int, pending: dict[str, str]) 
             except CommandError:
                 restored = await asyncio.to_thread(_restore_tt_binary_backup)
                 if restored:
-                    _tt_start_best_effort()
+                    await asyncio.to_thread(_tt_start_best_effort)
                 await _edit_task_card(
                     bot,
                     cid,
@@ -5619,11 +5705,11 @@ async def _tt_upgrade_task(bot, cid: int, msg_id: int, pending: dict[str, str]) 
                 kb=hub_inline_kb(),
             )
     except CommandError as e:
-        _tt_start_best_effort()
+        await asyncio.to_thread(_tt_start_best_effort)
         await _edit_task_card(bot, cid, msg_id, f"❌ {html.escape(str(e))}", kb=hub_inline_kb())
     except Exception:
         logger.exception("tt update task failed")
-        _tt_start_best_effort()
+        await asyncio.to_thread(_tt_start_best_effort)
         await _edit_task_card(
             bot,
             cid,
@@ -5643,7 +5729,7 @@ async def update_tt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if data == "ttupd_no":
         _ud(context).pop("pending_tt_update", None)
         await cb_answer(q)
-        await q.edit_message_text("Обновление TrustTunnel отменено.", reply_markup=hub_inline_kb())
+        await safe_edit_message_text(q, "Обновление TrustTunnel отменено.", reply_markup=hub_inline_kb())
         return
 
     if data != "ttupd_yes":
@@ -5652,7 +5738,7 @@ async def update_tt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     pending = _ud(context).get("pending_tt_update")
     if not pending:
         await cb_answer(q, "Нет запроса", alert=True)
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             "Нет активного запроса на обновление. Нажми кнопку еще раз.",
             reply_markup=hub_inline_kb(),
         )
@@ -5667,7 +5753,7 @@ async def update_tt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     busy_set("обновление TrustTunnel")
     try:
         await cb_answer(q, "Обновление запущено…", alert=True)
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             "⏳ <b>Обновление TrustTunnel</b> запущено.\n"
             "<i>Операция идёт в фоне, меню работает.</i>",
             parse_mode=ParseMode.HTML,
@@ -5691,26 +5777,25 @@ async def reboot_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q:
         return
 
-
     data = q.data or ""
 
     if data == "rbcancel":
         await cb_answer(q, "Отменено")
-        await q.edit_message_text("Перезагрузка отменена.", reply_markup=hub_inline_kb())
+        await safe_edit_message_text(q, "Перезагрузка отменена.", reply_markup=hub_inline_kb())
         return
 
     if data == "rbdo":
         if await _reject_if_busy(update):
             return
         await cb_answer(q, "Перезагрузка…", alert=True)
-        await q.edit_message_text("Перезагрузка сервера… ⏳")
+        await safe_edit_message_text(q, "Перезагрузка сервера… ⏳")
         try:
             cid = _chat_id(update)
             await send_inline_message(context.bot, chat_id=cid, text="После включения сервера снова нажми /start.")
             await asyncio.to_thread(_request_system_reboot_sync)
         except Exception:
             logger.exception("Reboot failed")
-            await q.edit_message_text(
+            await safe_edit_message_text(q,
                 "Ошибка. Не удалось выполнить reboot.", reply_markup=hub_inline_kb()
             )
 
@@ -5724,7 +5809,7 @@ async def os_upgrade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if data == "osupd_no":
         await cb_answer(q, "Отменено")
-        await q.edit_message_text(
+        await safe_edit_message_text(q,
             text=UI_OPEN_SERVER,
             parse_mode=ParseMode.HTML,
             reply_markup=server_hub_kb(),
@@ -5762,21 +5847,19 @@ CALLBACK_ROUTES: tuple[CallbackRoute, ...] = (
     CallbackRoute("reboot_callback", r"^(rbdo|rbcancel)$", reboot_callback, busy=False),
     CallbackRoute("os_upgrade_callback", r"^osupd_(yes|no)$", os_upgrade_callback, busy=False),
     CallbackRoute("info_refresh_callback", r"^infor$", info_refresh_callback, busy=False),
-    CallbackRoute("cert_refresh_callback", r"^certr$", cert_refresh_callback, busy=False),
     CallbackRoute("cert_log_callback", r"^certlog:", cert_log_callback, busy=False),
-    CallbackRoute("cert_update_callback", r"^certupd:", cert_update_callback, busy=False),
     CallbackRoute("user_search_cancel_callback", r"^searchcancel$", user_search_cancel_callback, busy=False),
     CallbackRoute("backup_confirm_callback", r"^bak:(yes|no)$", backup_confirm_callback, busy=False),
     CallbackRoute("clients_page_callback", r"^ss:", clients_page_callback),
     CallbackRoute("users_page_callback", r"^ul:", users_page_callback),
     CallbackRoute("users_filter_callback", r"^uf:", users_filter_callback),
     CallbackRoute("user_detail_callback", r"^udev:", user_detail_callback),
-    CallbackRoute("user_quick_qr_callback", r"^(uqr:|ure:)", user_quick_qr_callback),
-    CallbackRoute("user_quick_toml_callback", r"^utc:", user_quick_toml_callback),
-    CallbackRoute("user_quick_link_callback", r"^ulink:", user_quick_link_callback),
-    CallbackRoute("user_quick_all_callback", r"^uall:", user_quick_all_callback),
-    CallbackRoute("user_quick_rotate_callback", r"^urot:", user_quick_rotate_callback),
-    CallbackRoute("user_quick_del_callback", r"^udel:", user_quick_del_callback),
+    CallbackRoute("user_action_qr_callback", r"^(uqr:|ure:)", user_action_qr_callback),
+    CallbackRoute("user_action_toml_callback", r"^utc:", user_action_toml_callback),
+    CallbackRoute("user_action_link_callback", r"^ulink:", user_action_link_callback),
+    CallbackRoute("user_action_all_callback", r"^uall:", user_action_all_callback),
+    CallbackRoute("user_action_rotate_callback", r"^urot:", user_action_rotate_callback),
+    CallbackRoute("user_action_del_callback", r"^udel:", user_action_del_callback),
     CallbackRoute("rules_sync_callback", r"^rulesync:", rules_sync_callback),
     CallbackRoute("logs_filter_callback", r"^logf:", logs_filter_callback),
     CallbackRoute("restart_tt_confirm_callback", r"^ttrst_(yes|no)$", restart_tt_confirm_callback),
@@ -5792,6 +5875,13 @@ def build_callback_query_handler(route: CallbackRoute) -> CallbackQueryHandler:
 
 def main():
     runtime_lock = acquire_runtime_lock()
+    stale_busy = _consume_stale_busy_marker()
+    if stale_busy:
+        logger.warning(
+            "Обнаружен маркер занятости с прошлого запуска (%s) — "
+            "предыдущая операция могла не завершиться штатно, проверь вручную",
+            stale_busy,
+        )
     # Дефолты PTB (5s read/connect/write, 1s pool) слишком жёсткие для сети с
     # заминками — единичный сетевой тормоз превращается в TimedOut прямо в
     # хендлере и «Внутреннюю ошибку» у пользователя. Даём больше времени и

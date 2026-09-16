@@ -51,6 +51,7 @@ def tt_paths(bot_tt, tmp_path, monkeypatch):
         "RULES_FILE": tmp_path / "rules.toml",
         "PREFIX_MAP_FILE": tmp_path / "user_prefix_map.toml",
         "USER_PROFILES_FILE": tmp_path / "user_profiles.json",
+        "BUSY_MARKER_FILE": tmp_path / ".tt-bot-busy",
     }
     for name, value in paths.items():
         monkeypatch.setattr(bot_tt, name, value)
@@ -83,9 +84,9 @@ class FakeCallbackQuery:
 
 
 class FakeUpdate:
-    def __init__(self, user_id: int = 111111, text: str = "", callback_data: str | None = None):
+    def __init__(self, user_id: int = 111111, text: str = "", callback_data: str | None = None, chat_type: str = "private"):
         self.effective_user = FakeUser(user_id)
-        self.effective_chat = MagicMock(id=user_id)
+        self.effective_chat = MagicMock(id=user_id, type=chat_type)
         self.message = FakeMessage(text=text) if callback_data is None else None
         self.callback_query = FakeCallbackQuery(callback_data) if callback_data is not None else None
 
@@ -100,15 +101,15 @@ class FakeContext:
 @pytest.fixture()
 def allowed_update():
     """A message-based update from the one allowed admin (id=111111, see FAKE_ENV)."""
-    def _make(text: str = ""):
-        return FakeUpdate(user_id=111111, text=text)
+    def _make(text: str = "", chat_type: str = "private"):
+        return FakeUpdate(user_id=111111, text=text, chat_type=chat_type)
     return _make
 
 
 @pytest.fixture()
 def allowed_callback_update():
-    def _make(data: str):
-        return FakeUpdate(user_id=111111, callback_data=data)
+    def _make(data: str, chat_type: str = "private"):
+        return FakeUpdate(user_id=111111, callback_data=data, chat_type=chat_type)
     return _make
 
 

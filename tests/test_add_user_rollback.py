@@ -86,7 +86,7 @@ def test_add_user_random_prefix_rollback(bot_tt, tt_paths, monkeypatch):
 
     with pytest.raises(RuntimeError):
         bot_tt.add_user_and_make_link(
-            "newuser", "pass", random_prefix=True, protocol="h2"
+            "newuser", "pass", random_prefix=True
         )
 
     # credentials откатились
@@ -110,7 +110,7 @@ def test_add_user_random_prefix_rolls_back_map_and_rules_on_late_failure(
 
     creds_file.write_text('[[client]]\nusername = "old"\npassword = "oldpass"\n', encoding="utf-8")
 
-    def fake_generate_deeplink(username, *, generate_new_prefix=False, protocol=None, **kw):
+    def fake_generate_deeplink(username, *, generate_new_prefix=False, **kw):
         # Имитируем внешний бинарник: он сам создаёт allow-правило с новым префиксом.
         rules_file.write_text(
             '[[rule]]\nclient_random_prefix = "newpfx"\naction = "allow"\n', encoding="utf-8"
@@ -124,7 +124,7 @@ def test_add_user_random_prefix_rolls_back_map_and_rules_on_late_failure(
     monkeypatch.setattr(bot_tt, "apply_tt_config_change", boom_apply)
 
     with pytest.raises(RuntimeError, match="systemctl restart failed"):
-        bot_tt.add_user_and_make_link("newuser", "pass", random_prefix=True, protocol="h2")
+        bot_tt.add_user_and_make_link("newuser", "pass", random_prefix=True)
 
     assert bot_tt.list_usernames() == ["old"]
     assert not prefix_file.exists() or "newuser" not in prefix_file.read_text(encoding="utf-8")

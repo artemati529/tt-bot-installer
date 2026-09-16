@@ -137,7 +137,7 @@ def test_quick_qr_cleans_up_user_card_after_qr(
     update = allowed_callback_update("uqr:bob")
     update.callback_query.message = user_card
 
-    run_async(bot_tt.user_quick_qr_callback(update, context))
+    run_async(bot_tt.user_action_qr_callback(update, context))
 
     user_card.reply_photo.assert_awaited_once()
     user_card.delete.assert_awaited_once()

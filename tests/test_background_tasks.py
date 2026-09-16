@@ -53,16 +53,16 @@ def test_backup_confirm_callback_rejects_while_busy(bot_tt, allowed_callback_upd
     assert "Жди: обновление ОС" in update.callback_query.answer.await_args.kwargs["text"]
 
 
-def test_srv_osupd_rejects_while_busy(bot_tt, allowed_callback_update, context, run_async, monkeypatch):
-    """srv_callback перестал быть busy=True в целом
-    (иначе "меню работает" при апдейте ОС/TT было ложью для всего раздела
-    Сервер) — но запуск апдейта ОС (у него нет отдельного confirm-шага со
-    своим CallbackRoute) по-прежнему не должен стартовать, пока занято."""
+def test_srv_osupd_tap_shows_confirm_even_while_busy(bot_tt, allowed_callback_update, context, run_async, monkeypatch):
+    """srv:osupd — как и backup/restore/reboot/ttupd — только показывает
+    confirm-карточку; занятость проверяется на самом confirm (osupd_yes),
+    не раньше."""
     monkeypatch.setattr(
         bot_tt,
         "_run_apt_update_sync",
-        lambda: (_ for _ in ()).throw(AssertionError("os upgrade must not run while busy")),
+        lambda: (_ for _ in ()).throw(AssertionError("os upgrade must not run before confirm")),
     )
+    context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
     update = allowed_callback_update("srv:osupd")
 
     bot_tt.busy_set("бэкап конфигов")
@@ -72,13 +72,33 @@ def test_srv_osupd_rejects_while_busy(bot_tt, allowed_callback_update, context, 
         bot_tt.busy_clear()
 
     update.callback_query.answer.assert_awaited_once()
+    context.bot.send_message.assert_awaited_once()
+
+
+def test_os_upgrade_confirm_rejects_while_busy(bot_tt, allowed_callback_update, context, run_async, monkeypatch):
+    """osupd_yes — единственное место, где занятость реально проверяется
+    для OS-upgrade, тем же механизмом, что и у backup/reboot."""
+    monkeypatch.setattr(
+        bot_tt,
+        "_run_apt_update_sync",
+        lambda: (_ for _ in ()).throw(AssertionError("os upgrade must not run while busy")),
+    )
+    update = allowed_callback_update("osupd_yes")
+
+    bot_tt.busy_set("бэкап конфигов")
+    try:
+        run_async(bot_tt.os_upgrade_callback(update, context))
+    finally:
+        bot_tt.busy_clear()
+
+    update.callback_query.answer.assert_awaited_once()
     assert "Жди: бэкап конфигов" in update.callback_query.answer.await_args.kwargs["text"]
 
 
 def test_srv_backup_action_still_shown_while_busy(bot_tt, allowed_callback_update, context, run_async):
-    """"Меню работает": тап другого действия под Сервер (не сам осupd) во
-    время фоновой операции должен показать свою confirm-карточку, а не тост
-    "Жди" — блокировка теперь только на самой длинной операции (osupd)."""
+    """"Меню работает": тап действия под Сервер во время фоновой операции
+    должен показать свою confirm-карточку, а не тост "Жди" — занятость
+    проверяется только на самом confirm-шаге, не на первом тапе."""
     context.bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
     update = allowed_callback_update("srv:backup")
 
@@ -89,24 +109,6 @@ def test_srv_backup_action_still_shown_while_busy(bot_tt, allowed_callback_updat
         bot_tt.busy_clear()
 
     context.bot.send_message.assert_awaited()
-
-
-def test_cert_update_callback_schedules_background_task(bot_tt, allowed_callback_update, context, run_async, monkeypatch):
-    scheduled = []
-    monkeypatch.setattr(bot_tt, "_schedule_background_task", lambda ctx, coro: scheduled.append(coro), raising=False)
-    monkeypatch.setattr(bot_tt, "_renew_cert_sync", lambda: (_ for _ in ()).throw(AssertionError("renew must be background")))
-    update = allowed_callback_update("certupd:do")
-    bot_tt.busy_clear()
-    try:
-        run_async(bot_tt.cert_update_callback(update, context))
-
-        assert bot_tt.busy_label().startswith("обновление сертификата")
-        assert len(scheduled) == 1
-        update.callback_query.edit_message_text.assert_awaited_once()
-        assert "Операция идёт в фоне" in update.callback_query.edit_message_text.await_args.args[0]
-    finally:
-        bot_tt.busy_clear()
-        _close_scheduled(scheduled)
 
 
 def test_update_tt_callback_schedules_background_task(bot_tt, allowed_callback_update, context, run_async, monkeypatch):

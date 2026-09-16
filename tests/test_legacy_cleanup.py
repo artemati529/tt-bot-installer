@@ -26,13 +26,17 @@ def test_legacy_reply_keyboard_wrappers_are_removed(bot_tt):
         "run_logs",
         "run_users_list",
         "run_rules_sync_view",
+        "cert_update_callback",
+        "cert_refresh_callback",
+        "_renew_cert_sync",
+        "_cert_renew_task",
     )
 
     for name in removed:
         assert not hasattr(bot_tt, name), f"{name} must stay removed"
 
     assert hasattr(bot_tt, "add_entry_cb")
-    assert hasattr(bot_tt, "tap_restart_tt")
+    assert hasattr(bot_tt, "restart_tt_prompt_callback")
 
 
 def test_footer_navigation_has_no_monitor_compat_key(bot_tt):

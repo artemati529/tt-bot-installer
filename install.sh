@@ -5,6 +5,8 @@
 # Run as root: sudo ./install.sh
 set -euo pipefail
 
+# cd-failure and pwd-failure both intentionally fall through to empty string
+# shellcheck disable=SC2015
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" 2>/dev/null && pwd || true)"
 TT_DIR="/opt/trusttunnel"
 BOT_DIR="/opt/tt-bot"
@@ -190,6 +192,8 @@ ExecStart=${BOT_DIR}/.venv/bin/python3 ${BOT_DIR}/bot.py
 Restart=always
 RestartSec=3
 User=root
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

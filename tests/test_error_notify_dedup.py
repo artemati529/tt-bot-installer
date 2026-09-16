@@ -14,7 +14,7 @@ def _fresh_context():
 
 
 def test_only_first_error_in_window_sends_a_message(bot_tt, run_async, monkeypatch):
-    monkeypatch.setattr(bot_tt, "_error_notify_state", {"window_start": 0.0, "suppressed": 0})
+    monkeypatch.setattr(bot_tt, "_error_notify_state", {"window_start": None, "suppressed": 0})
     context = _fresh_context()
 
     run_async(bot_tt.log_unhandled_error(None, context))
@@ -25,7 +25,7 @@ def test_only_first_error_in_window_sends_a_message(bot_tt, run_async, monkeypat
 
 
 def test_next_window_mentions_suppressed_count(bot_tt, run_async, monkeypatch):
-    monkeypatch.setattr(bot_tt, "_error_notify_state", {"window_start": 0.0, "suppressed": 0})
+    monkeypatch.setattr(bot_tt, "_error_notify_state", {"window_start": None, "suppressed": 0})
     context = _fresh_context()
     fake_now = [1000.0]
     monkeypatch.setattr(bot_tt, "monotonic", lambda: fake_now[0])
@@ -42,9 +42,7 @@ def test_next_window_mentions_suppressed_count(bot_tt, run_async, monkeypatch):
 
 
 def test_first_error_ever_still_sends_immediately(bot_tt, run_async, monkeypatch):
-    # window_start=0.0 значит "никогда не отправляли" — первая же ошибка
-    # не должна попасть в "подавленные" из-за monotonic() тоже начинающегося не с нуля.
-    monkeypatch.setattr(bot_tt, "_error_notify_state", {"window_start": 0.0, "suppressed": 0})
+    monkeypatch.setattr(bot_tt, "_error_notify_state", {"window_start": None, "suppressed": 0})
     context = _fresh_context()
 
     run_async(bot_tt.log_unhandled_error(None, context))

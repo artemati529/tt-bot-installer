@@ -19,7 +19,7 @@ def test_rotate_entrypoints_use_same_prompt_text(
     context.bot.send_message.reset_mock()
     quick_update = allowed_callback_update("urot:alice")
 
-    run_async(bot_tt.user_quick_rotate_callback(quick_update, context))
+    run_async(bot_tt.user_action_rotate_callback(quick_update, context))
 
     quick_text = context.bot.send_message.await_args.kwargs["text"]
     assert context.user_data["pending_rotate_username"] == "alice"
@@ -33,7 +33,7 @@ def test_delete_entrypoints_use_same_confirm_card(
     quick_update = allowed_callback_update("udel:alice")
 
     run_async(bot_tt.delete_user_callback(list_update, context))
-    run_async(bot_tt.user_quick_del_callback(quick_update, context))
+    run_async(bot_tt.user_action_del_callback(quick_update, context))
 
     list_call = list_update.callback_query.edit_message_text.await_args
     quick_call = quick_update.callback_query.edit_message_text.await_args

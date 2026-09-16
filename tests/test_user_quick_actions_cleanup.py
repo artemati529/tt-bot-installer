@@ -25,7 +25,7 @@ def test_quick_toml_deletes_source_card(bot_tt, allowed_callback_update, context
     update = allowed_callback_update("utc:alice")
     update.callback_query.message = source
 
-    run_async(bot_tt.user_quick_toml_callback(update, context))
+    run_async(bot_tt.user_action_toml_callback(update, context))
 
     context.bot.send_document.assert_awaited_once()
     assert context.bot.send_document.await_args.kwargs["disable_notification"] is True
@@ -38,7 +38,7 @@ def test_quick_link_deletes_source_card(bot_tt, allowed_callback_update, context
     update = allowed_callback_update("ulink:alice")
     update.callback_query.message = source
 
-    run_async(bot_tt.user_quick_link_callback(update, context))
+    run_async(bot_tt.user_action_link_callback(update, context))
 
     context.bot.send_message.assert_awaited_once()
     source.delete.assert_awaited_once()
@@ -51,7 +51,7 @@ def test_quick_all_deletes_source_card(bot_tt, allowed_callback_update, context,
     update = allowed_callback_update("uall:alice")
     update.callback_query.message = source
 
-    run_async(bot_tt.user_quick_all_callback(update, context))
+    run_async(bot_tt.user_action_all_callback(update, context))
 
     source.reply_photo.assert_awaited_once()
     context.bot.send_document.assert_awaited_once()
@@ -65,7 +65,7 @@ def test_quick_rotate_deletes_source_card(bot_tt, allowed_callback_update, conte
     update = allowed_callback_update("urot:alice")
     update.callback_query.message = source
 
-    run_async(bot_tt.user_quick_rotate_callback(update, context))
+    run_async(bot_tt.user_action_rotate_callback(update, context))
 
     context.bot.send_message.assert_awaited_once()
     source.delete.assert_awaited_once()

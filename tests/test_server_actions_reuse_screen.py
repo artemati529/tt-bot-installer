@@ -36,7 +36,7 @@ def tracked_context(bot_tt, context):
 def test_tap_restart_tt_reuses_tracked_screen(bot_tt, allowed_callback_update, tracked_context, run_async):
     update = allowed_callback_update("srv:restart")
 
-    run_async(bot_tt.tap_restart_tt(update, tracked_context))
+    run_async(bot_tt.restart_tt_prompt_callback(update, tracked_context))
 
     tracked_context.bot.edit_message_text.assert_called_once()
     assert tracked_context.bot.edit_message_text.call_args.kwargs["message_id"] == 111
@@ -90,10 +90,10 @@ def test_backup_confirm_no_returns_server_card(bot_tt, allowed_callback_update, 
     run_async(bot_tt.backup_confirm_callback(update, context))
 
     update.callback_query.edit_message_text.assert_awaited_once()
-    kwargs = update.callback_query.edit_message_text.await_args.kwargs
-    assert kwargs["text"] == bot_tt.UI_OPEN_SERVER
-    assert kwargs["parse_mode"] == bot_tt.ParseMode.HTML
-    assert "srv:backup" in _button_datas(kwargs["reply_markup"])
+    args = update.callback_query.edit_message_text.await_args
+    assert args.args[0] == bot_tt.UI_OPEN_SERVER
+    assert args.kwargs["parse_mode"] == bot_tt.ParseMode.HTML
+    assert "srv:backup" in _button_datas(args.kwargs["reply_markup"])
 
 
 def test_run_restore_pick_reuses_tracked_screen(bot_tt, tracked_context, run_async, monkeypatch):

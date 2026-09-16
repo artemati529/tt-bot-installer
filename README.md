@@ -84,7 +84,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
 
-317 тестов на `bot.py`, чистые mypy/ruff/pyflakes.
+Полное покрытие `bot.py` (число тестов растёт — точное см. в выводе `pytest`), чистые mypy/ruff/pyflakes.
 
 ## Файлы
 

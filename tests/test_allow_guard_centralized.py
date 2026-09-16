@@ -1,7 +1,7 @@
 """is_allowed(update) не должен дублироваться вручную по всем хендлерам с
 разным (случайным) поведением на отказ — часть callback-хендлеров отвечала
 тостом "Нет доступа", часть молчала, а 4 функции (ui_back_home/ui_open_vpn/
-ui_open_server/tap_restart_tt) вообще не нужно было проверять — они
+ui_open_server/restart_tt_prompt_callback) вообще не нужно было проверять — они
 достижимы только через уже проверенных вызывающих.
 
 Точная карта 48 (пересчитана по коду, не по памяти):
@@ -11,7 +11,7 @@ ui_open_server/tap_restart_tt) вообще не нужно было прове�
   ещё и отдельной командой в main())
 - 6 — прямые команды/сообщения в main() (start, menu_button_tap, myid,
   status, user_search_text, rotate_password_input)
-- 4 — убраны вообще (ui_back_home, ui_open_vpn, ui_open_server, tap_restart_tt)
+- 4 — убраны вообще (ui_back_home, ui_open_vpn, ui_open_server, restart_tt_prompt_callback)
 
 Итого 31+7+6+4 = 48. Гвард один (allow_guard), is_allowed(update) вызывается
 теперь только внутри него.

@@ -30,7 +30,7 @@ def test_quick_link_hides_deeplink_in_spoiler(bot_tt, allowed_callback_update, c
     update = allowed_callback_update("ulink:alice")
     update.callback_query.message = _FakeMsg()
 
-    run_async(bot_tt.user_quick_link_callback(update, context))
+    run_async(bot_tt.user_action_link_callback(update, context))
 
     sent = context.bot.send_message.await_args
     text = sent.kwargs.get("text") or (sent.args[0] if sent.args else "")
@@ -57,7 +57,7 @@ def test_quick_all_hides_deeplink_in_spoiler(bot_tt, allowed_callback_update, co
     update = allowed_callback_update("uall:alice")
     update.callback_query.message = msg
 
-    run_async(bot_tt.user_quick_all_callback(update, context))
+    run_async(bot_tt.user_action_all_callback(update, context))
 
     sent = context.bot.send_message.await_args
     text = sent.kwargs.get("text") or (sent.args[0] if sent.args else "")

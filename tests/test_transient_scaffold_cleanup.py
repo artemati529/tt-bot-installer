@@ -150,7 +150,7 @@ def test_urot_prompt_burned_on_nav(
     context.bot.delete_message = AsyncMock()
 
     update = allowed_callback_update("urot:alice")
-    run_async(bot_tt.user_quick_rotate_callback(update, context))
+    run_async(bot_tt.user_action_rotate_callback(update, context))
 
     scaffold = context.user_data[bot_tt.ROTATE_SCAFFOLD_KEY]
     assert len(scaffold) == 1
@@ -175,11 +175,11 @@ def test_second_rotation_removes_first_prompt(
     context.bot.delete_message = AsyncMock()
 
     u1 = allowed_callback_update("urot:alice")
-    run_async(bot_tt.user_quick_rotate_callback(u1, context))
+    run_async(bot_tt.user_action_rotate_callback(u1, context))
     assert context.user_data[bot_tt.ROTATE_SCAFFOLD_KEY] == [(111111, 100)]
 
     u2 = allowed_callback_update("urot:bob")
-    run_async(bot_tt.user_quick_rotate_callback(u2, context))
+    run_async(bot_tt.user_action_rotate_callback(u2, context))
 
     deleted = {c[1]["message_id"] for c in context.bot.delete_message.call_args_list}
     assert 100 in deleted
@@ -214,7 +214,7 @@ def test_urot_prompt_back_keeps_card(
     # Start urot: — tracks the new prompt, burns the old card
     urot_update = allowed_callback_update("urot:alice")
     urot_update.callback_query.message = old_card
-    run_async(bot_tt.user_quick_rotate_callback(urot_update, context))
+    run_async(bot_tt.user_action_rotate_callback(urot_update, context))
 
     assert context.user_data[bot_tt.ROTATE_SCAFFOLD_KEY] == [(111111, 100)]
 

@@ -44,7 +44,6 @@ def test_refresh_buttons_use_common_label(bot_tt):
     keyboards = (
         bot_tt.server_card_inline_kb(),
         bot_tt.logs_inline_kb("all", 50, 0, 1),
-        bot_tt.cert_card_inline_kb(),
         bot_tt.rules_sync_inline_kb(),
     )
 
@@ -69,5 +68,5 @@ def test_certbot_log_uses_common_back_label(bot_tt, allowed_callback_update, run
     run_async(bot_tt.cert_log_callback(update, None))
 
     kb = update.callback_query.edit_message_text.await_args.kwargs["reply_markup"]
-    assert _datas(kb)[-1] == "certr"
+    assert _datas(kb)[-1] == "nav:cert"
     assert _texts(kb)[-1] == "⬅️ Назад"
