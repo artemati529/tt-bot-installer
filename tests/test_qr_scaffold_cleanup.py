@@ -130,6 +130,7 @@ def test_export_protocol_does_not_persist_chosen_protocol(
 def test_quick_qr_cleans_up_user_card_after_qr(
     bot_tt, allowed_callback_update, context, run_async, monkeypatch
 ):
+    monkeypatch.setattr(bot_tt, "list_usernames", lambda: ["bob"])
     monkeypatch.setattr(bot_tt, "_export_context_for_username", lambda username: ("", "h2"))
     monkeypatch.setattr(bot_tt, "_export_bundle_sync", lambda *a: ("tt://?fake", b"fake-png"))
 

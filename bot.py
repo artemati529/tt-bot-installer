@@ -4169,6 +4169,14 @@ async def user_action_qr_callback(update: Update, context: ContextTypes.DEFAULT_
         return
     await cb_answer(q, "QR…")
     username = data.split(":", 1)[1]
+    try:
+        known = await asyncio.to_thread(list_usernames)
+    except ValueError:
+        await cb_answer(q, "credentials.toml повреждён", alert=True)
+        return
+    if username not in known:
+        await cb_answer(q, "Пользователь не найден", alert=True)
+        return
     label = "повтор QR" if data.startswith("ure:") else "экспорт из списка"
     try:
         await _send_user_qr(q, context, username, label)
@@ -4536,6 +4544,10 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=cert_card_inline_kb(),
         )
         return
+
+    # Неизвестный nav:* (например, кнопка из старой версии карточки) — иначе
+    # спиннер крутится до таймаута, не получив answerCallbackQuery.
+    await cb_answer(q)
 
 
 async def srv_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5264,6 +5276,7 @@ async def cert_log_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data or ""
     if not data.startswith("certlog:"):
         return
+    await cb_answer(q)
     try:
         lines = int((q.data or "certlog:20").split(":", 1)[1])
     except ValueError:
@@ -5867,9 +5880,24 @@ CALLBACK_ROUTES: tuple[CallbackRoute, ...] = (
 )
 
 
+def cancel_stray_add_flow(handler):
+    """Любой маршрут из CALLBACK_ROUTES не относится к сценарию добавления
+    пользователя (он живёт в своём ConversationHandler) — если юзер ушёл
+    в другой раздел посреди добавления, сценарий надо считать брошенным,
+    иначе следующий текст улетит в него как забытый пароль/username."""
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if _ud(context).get("add_flow_active"):
+            await cancel_add_flow(context)
+        return await handler(update, context)
+
+    return wrapper
+
+
 def build_callback_query_handler(route: CallbackRoute) -> CallbackQueryHandler:
     handler = busy_guard(route.handler) if route.busy else route.handler
     handler = allow_guard(handler)
+    handler = cancel_stray_add_flow(handler)
     return CallbackQueryHandler(traced_callback(route.name, handler), pattern=route.pattern)
 
 
