@@ -166,13 +166,13 @@ python3 -m venv "$BOT_DIR/.venv"
 cp "$SCRIPT_DIR/bot.py" "$BOT_DIR/bot.py"
 chmod 700 "$BOT_DIR/bot.py"
 
-cat > "$BOT_DIR/.env" <<EOF
-BOT_TOKEN=${BOT_TOKEN}
-ALLOWED_USER_ID=${ALLOWED_USER_ID}
-ENDPOINT_ADDRESS=${ENDPOINT_ADDRESS}
-SERVER_NAME=${SERVER_NAME}
-VPN_MONITOR_PORT=${VPN_MONITOR_PORT}
-EOF
+{
+    printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN"
+    printf 'ALLOWED_USER_ID=%s\n' "$ALLOWED_USER_ID"
+    printf 'ENDPOINT_ADDRESS=%s\n' "$ENDPOINT_ADDRESS"
+    printf 'SERVER_NAME=%s\n' "$SERVER_NAME"
+    printf 'VPN_MONITOR_PORT=%s\n' "$VPN_MONITOR_PORT"
+} > "$BOT_DIR/.env"
 chmod 600 "$BOT_DIR/.env"
 
 # ---------------------------------------------------------------------------

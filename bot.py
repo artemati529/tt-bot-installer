@@ -15,8 +15,7 @@ FILE MAP (секции сверху вниз):
   5.  UI: text & keyboards        — UI_*, _status_emoji, confirm_kb, card_footer_row,
                                     refresh_back_row, merge_inline_kb, hub/vpn/server kb
   6.  Subprocess & caching        — CommandError, run_process/run_cmd/run_shell,
-                                    cached_compute (thread-safe, single-flight),
-                                    invalidate_monitor_cache
+                                    cached_compute (thread-safe, single-flight)
   7.  Monitoring & server cards   — server/info card, cert card + certbot timer,
                                     clients card, logs view, metrics/ram/disk/network
   8.  Backups & restore           — create_configs_backup, restore_file/_multiple,
@@ -159,7 +158,7 @@ warnings.filterwarnings(
     category=PTBUserWarning,
 )
 
-# Settings
+# Настройки
 ENV_PATH = Path(os.environ.get("TT_BOT_ENV_PATH", "/opt/tt-bot/.env"))
 TT_DIR = Path("/opt/trusttunnel")
 CRED_FILE = TT_DIR / "credentials.toml"
@@ -755,7 +754,7 @@ MONITOR_CACHE: dict[str, tuple[float, Any]] = {}
 METRICS_CLIENTS_URL = (env.get("METRICS_CLIENTS_URL", "") or "http://127.0.0.1:1987/clients").strip()
 LOG_CHUNK_CHARS = 3200
 CERT_WARN_DAYS = 14
-# TOML-only exclusions. Deeplink/QR has no routing field.
+# Только для TOML — у deeplink/QR нет поля роутинга.
 SPLIT_RU_EXCLUSIONS = [
     "*.ru",
     "*.su",
@@ -974,7 +973,7 @@ def server_hub_kb() -> InlineKeyboardMarkup:
     )
 
 
-# Utilities
+# Утилиты
 class CommandError(RuntimeError):
     pass
 
@@ -1048,8 +1047,20 @@ def run_process(
                 out, err = proc.communicate(timeout=timeout)
             else:
                 proc.wait(timeout=timeout)
+                # Демонизирующийся потомок (например, постинст-скрипт при
+                # apt upgrade) может унаследовать pipe и держать его открытым
+                # даже после завершения нашего прямого потомка — тогда read()
+                # никогда не получит EOF. Поэтому ждём с ограничением, а не
+                # бесконечно.
+                join_deadline = monotonic() + 5
                 for t in reader_threads:
-                    t.join()
+                    t.join(timeout=max(0.0, join_deadline - monotonic()))
+                    if t.is_alive():
+                        logger.warning(
+                            "run_process: pipe reader still running after child exit "
+                            "(cmd=%s) — a grandchild may be holding the pipe open",
+                            " ".join(cmd),
+                        )
                 out = out_box[0].decode("utf-8", "replace") if out_box else ""
                 err = err_box[0].decode("utf-8", "replace") if err_box else ""
         except subprocess.TimeoutExpired:
@@ -1131,12 +1142,6 @@ def cached_compute(key: str, ttl_sec: int, producer):
         with _MONITOR_CACHE_LOCK:
             MONITOR_CACHE[key] = (monotonic(), val)
         return val
-
-
-def invalidate_monitor_cache(key: str) -> None:
-    """Убрать ключ из кэша (например после смены сертификата)."""
-    with _MONITOR_CACHE_LOCK:
-        MONITOR_CACHE.pop(key, None)
 
 
 def parse_meminfo() -> dict[str, int]:
@@ -1457,7 +1462,8 @@ def _certbot_timer_lines() -> tuple[str, str]:
     )
     if list_line:
         parts = list_line.split()
-        # NEXT(weekday date time tz) LEFT(amount "left") LAST ...
+        # Колонки вывода systemctl list-timers: NEXT(день недели, дата, время,
+        # tz) LEFT(остаток, "left") LAST ...
         if len(parts) >= 6:
             left = " ".join(parts[4:6])
             scheduled = " ".join(parts[:4])
@@ -1779,7 +1785,7 @@ def list_files_in_latest_backup() -> list[str]:
         return []
 
 
-_PASSWORD_VALUE_RE = re.compile(r'password\s*=\s*"[^"]*"')
+_PASSWORD_VALUE_RE = re.compile(r'password\s*=\s*(?:"[^"]*"|\'[^\']*\')')
 
 
 def _mask_passwords(text: str) -> str:
@@ -1869,11 +1875,7 @@ def restore_file_from_latest_backup(filename: str, *, restart_service: bool = Tr
         old_mode = target.stat().st_mode & 0o777 if target.exists() else None
         if target.exists():
             prev = restore_backup_dir / f"{filename}.{stamp}"
-            prev.write_bytes(target.read_bytes())
-            # Копия наследует umask (0644) — для credentials это утечка паролей,
-            # поэтому права сохраняем исходные.
-            if old_mode is not None:
-                prev.chmod(old_mode)
+            _atomic_write_bytes(prev, target.read_bytes(), mode=old_mode)
             _prune_backup_dir(restore_backup_dir, f"{filename}.*", BACKUP_KEEP_RESTORE_PREV)
         with NamedTemporaryFile("wb", dir=str(TT_DIR), delete=False) as tmp:
             tmp.write(data)
@@ -2130,9 +2132,9 @@ def _backup_rules_file(raw: str) -> None:
 
 def _empty_rules_toml_text() -> str:
     return (
-        "# Rules configuration for VPN endpoint connection filtering\n"
-        "# Auto-managed by tt-bot.\n"
-        "# No explicit [[rule]] blocks; TrustTunnel default policy applies.\n"
+        "# Правила фильтрации подключений VPN-эндпоинта\n"
+        "# Управляется автоматически tt-bot.\n"
+        "# Явных блоков [[rule]] нет — действует политика TrustTunnel по умолчанию.\n"
         "\n"
     )
 
@@ -2595,17 +2597,22 @@ def toml_share_kb(username: str) -> InlineKeyboardMarkup:
 
 
 def validate_tt_configs() -> tuple[bool, str]:
-    try:
-        p = run_process(
-            ["./trusttunnel_endpoint", "vpn.toml", "hosts.toml", "-v"],
-            cwd=TT_DIR,
-            timeout=30,
-            retries=0,
-        )
-        out = (p.stdout or p.stderr or "").strip()
-        return True, out or "ok"
-    except (CommandError, OSError) as e:
-        return False, str(e)
+    """Проверяет TOML-синтаксис vpn.toml/hosts.toml перед restart/reload.
+
+    Раньше звала `trusttunnel_endpoint vpn.toml hosts.toml -v` — но -v это
+    --version у самого эндпоинта: печатает версию и выходит, не читая
+    settings-файлы вообще (проверено по исходнику main.rs). Проверка была
+    no-op и всегда возвращала успех независимо от содержимого файлов.
+    """
+    for name in ("vpn.toml", "hosts.toml"):
+        path = TT_DIR / name
+        try:
+            tomlkit.parse(path.read_text(encoding="utf-8"))
+        except OSError as e:
+            return False, f"{name}: {e}"
+        except ValueError as e:
+            return False, f"{name}: некорректный TOML — {e}"
+    return True, "ok"
 
 
 def service_reload_tls_if_possible() -> bool:
@@ -3152,7 +3159,7 @@ def is_newer(latest: str, current: str) -> bool:
     return parse_version(latest) > parse_version(current)
 
 
-# Actions
+# Действия
 
 
 def build_add_conversation() -> ConversationHandler:
@@ -3920,7 +3927,7 @@ async def run_reboot_confirm(bot, cid: int, *, context: ContextTypes.DEFAULT_TYP
     )
 
 
-# Home screen
+# Главный экран
 async def send_home_screen(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -4681,7 +4688,7 @@ async def _go_home(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_home_screen(message, context)
 
 
-# Command handlers
+# Обработчики команд
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Один носитель ReplyKeyboardMarkup на чат, не дублировать на каждом /start.
     # Чистые эмодзи нельзя — Telegram рисует их стикером.
@@ -4780,7 +4787,7 @@ def _untrack_scaffold(context: ContextTypes.DEFAULT_TYPE, key: str, message: Mes
         _ud(context).pop(key, None)
 
 
-# User search
+# Поиск пользователя
 def _track_user_search_message(context: ContextTypes.DEFAULT_TYPE, message: Message) -> None:
     _ud(context).setdefault(USER_SEARCH_SCAFFOLD_KEY, []).append((message.chat_id, message.message_id))
 
@@ -4798,7 +4805,7 @@ async def _cleanup_user_search_scaffold(
     await _burn_scaffold(bot, context, USER_SEARCH_SCAFFOLD_KEY, extra=current_message)
 
 
-# Add user
+# Добавление пользователя
 def _track_add_flow_message(context: ContextTypes.DEFAULT_TYPE, message: Message) -> None:
     _ud(context).setdefault(ADD_FLOW_SCAFFOLD_KEY, []).append((message.chat_id, message.message_id))
 
@@ -4816,7 +4823,7 @@ async def _cleanup_add_flow_scaffold(
     await _burn_scaffold(bot, context, ADD_FLOW_SCAFFOLD_KEY, keep=keep_message)
 
 
-# Rotate password prompt
+# Промпт смены пароля
 async def _cleanup_rotate_scaffold(bot, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _burn_scaffold(bot, context, ROTATE_SCAFFOLD_KEY)
 
@@ -5039,7 +5046,7 @@ async def add_protocol_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# Rotate password
+# Смена пароля
 async def rotate_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
 
@@ -5109,7 +5116,7 @@ async def rotate_password_input(update: Update, context: ContextTypes.DEFAULT_TY
         await _delete_message_quiet(message)
 
 
-# Export user
+# Экспорт пользователя
 async def export_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
 
@@ -5231,7 +5238,7 @@ async def toml_export_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         await best_effort_edit(q, f"❌ Не удалось сформировать TOML.\n<code>{html.escape(str(e)[:300])}</code>", parse_mode=ParseMode.HTML)
 
 
-# Monitoring callbacks
+# Колбэки мониторинга
 
 
 async def info_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5416,14 +5423,30 @@ async def restart_tt_confirm_callback(update: Update, context: ContextTypes.DEFA
         )
 
 
+def _undo_rotate_password_sync(username: str, old_password: str) -> bool:
+    """Откатывает ротацию на уровне файла+сервиса. Возвращает False, если
+    юзер не найден. При падении apply_tt_config_change возвращает
+    credentials.toml к состоянию до этого вызова и пробрасывает исключение —
+    тот же паттерн, что в _apply_rotate_password_sync."""
+    _, old_text = _load_credentials_doc()
+    changed = rotate_user_password(username, old_password)
+    if not changed:
+        return False
+    try:
+        apply_tt_config_change()
+    except Exception:
+        _atomic_write_credentials(old_text, old_text)
+        raise
+    return True
+
+
 async def _undo_rotate_password(q, payload: dict[str, Any]) -> None:
     username = payload["username"]
     async with CRED_LOCK:
-        changed = await asyncio.to_thread(rotate_user_password, username, payload["old_password"])
+        changed = await asyncio.to_thread(_undo_rotate_password_sync, username, payload["old_password"])
     if not changed:
         await cb_answer(q, f"Пользователь {username} не найден", alert=True)
         return
-    await asyncio.to_thread(apply_tt_config_change)
     await cb_answer(q, "Пароль возвращён", alert=True)
     await q.edit_message_caption(
         caption=f"↩️ Пароль <code>{html.escape(username)}</code> возвращён к предыдущему.",
@@ -5434,22 +5457,30 @@ async def _undo_rotate_password(q, payload: dict[str, Any]) -> None:
 
 async def _undo_delete_user(q, payload: dict[str, Any]) -> None:
     username = payload["username"]
+    random_prefix = payload.get("random_prefix", False)
+    protocol = _normalize_protocol(str(payload.get("protocol", "h2")))
     try:
         async with CRED_LOCK:
-            await asyncio.to_thread(
-                add_user_and_make_link,
-                username,
-                payload["password"],
-                random_prefix=payload.get("random_prefix", False),
+            deeplink, png = await asyncio.to_thread(
+                _add_user_bundle_sync, username, payload["password"], random_prefix
             )
+            await asyncio.to_thread(_set_user_profile, username, protocol=protocol, random_prefix=random_prefix)
     except ValueError as e:
         await cb_answer(q, str(e), alert=True)
         return
     await cb_answer(q, "Пользователь восстановлен", alert=True)
-    await safe_edit_message_text(q,
-        f"↩️ Пользователь <code>{html.escape(username)}</code> восстановлен.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=hub_inline_kb(),
+    msg = _accessible(q.message)
+    if msg is None:
+        return
+    # Удаление сняло старый prefix — если он был случайным, новый deeplink
+    # неизбежно другой, старая ссылка у клиента больше не рабочая.
+    await reply_deeplink_with_qr(
+        msg,
+        username=username,
+        deeplink=deeplink,
+        action_label="восстановление после удаления",
+        mode_label=_protocol_label(protocol),
+        png=png,
     )
 
 
@@ -5503,7 +5534,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# Users and delete confirmation
+# Пользователи и подтверждение удаления
 async def delete_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     assert q is not None
@@ -5569,6 +5600,7 @@ async def delete_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                         "username": username,
                         "password": old_password,
                         "random_prefix": bool(prof.get("random_prefix")),
+                        "protocol": prof.get("protocol", "h2"),
                     },
                 )
                 kb = _with_undo_row(kb)
@@ -5669,7 +5701,7 @@ async def restore_backup_callback(update: Update, context: ContextTypes.DEFAULT_
         await safe_edit_message_text(q, "Восстановление отменено.", reply_markup=hub_inline_kb())
 
 
-# TrustTunnel update callbacks
+# Колбэки обновления TrustTunnel
 
 
 async def _tt_upgrade_task(bot, cid: int, msg_id: int, pending: dict[str, str]) -> None:

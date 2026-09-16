@@ -44,3 +44,12 @@ def test_diff_no_false_change_when_password_unchanged(bot_tt, tt_paths):
     diff_text = bot_tt._diff_against_latest_backup()
 
     assert diff_text == "Изменений нет — конфиги совпадают с последним бэкапом."
+
+
+def test_mask_passwords_covers_single_quotes(bot_tt):
+    text = "[[client]]\nusername = \"alice\"\npassword = 'my!secret'\n"
+
+    masked = bot_tt._mask_passwords(text)
+
+    assert "my!secret" not in masked
+    assert "•••" in masked
