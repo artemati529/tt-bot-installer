@@ -440,35 +440,60 @@ def is_message_not_modified(exc: BaseException) -> bool:
 
 UI_MESSAGE_ID_KEY = "ui_message_id"
 
+# Ключи-списки [(chat_id, message_id), ...] — сообщения-«черновики», которые
+# сгорают через _burn_scaffold. Персистятся вместе с UI_MESSAGE_ID_KEY тем же
+# механизмом: рестарт бота иначе оставлял их висеть в чате навсегда.
+_UI_STATE_LIST_KEYS = (USER_SEARCH_SCAFFOLD_KEY, ADD_FLOW_SCAFFOLD_KEY, ROTATE_SCAFFOLD_KEY)
 
-def _save_ui_message_id(message_id: int) -> None:
+
+def _save_ui_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    ud = _ud(context)
+    state: dict[str, Any] = {}
+    msg_id = ud.get(UI_MESSAGE_ID_KEY)
+    if isinstance(msg_id, int):
+        state["ui_message_id"] = msg_id
+    for key in _UI_STATE_LIST_KEYS:
+        refs = ud.get(key)
+        if refs:
+            state[key] = [list(ref) for ref in refs]
     try:
-        UI_STATE_FILE.write_text(json.dumps({"ui_message_id": message_id}), encoding="utf-8")
-    except OSError as e:
-        logger.debug("Не удалось сохранить ui_message_id: %s", e)
+        UI_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+    except (OSError, TypeError) as e:
+        logger.debug("Не удалось сохранить состояние UI: %s", e)
 
 
-def _load_ui_message_id() -> int | None:
+def _load_ui_state() -> dict[str, Any]:
     if not UI_STATE_FILE.exists():
-        return None
+        return {}
     try:
-        value = json.loads(UI_STATE_FILE.read_text(encoding="utf-8")).get("ui_message_id")
+        data = json.loads(UI_STATE_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
-    return value if isinstance(value, int) else None
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _restore_ui_state(app: Application) -> None:
+    state = _load_ui_state()
+    if not state:
+        return
+    ud = app.user_data[ALLOWED_USER_ID]
+    msg_id = state.get("ui_message_id")
+    if isinstance(msg_id, int):
+        ud[UI_MESSAGE_ID_KEY] = msg_id
+    for key in _UI_STATE_LIST_KEYS:
+        refs = state.get(key)
+        if not isinstance(refs, list):
+            continue
+        valid = [tuple(ref) for ref in refs if isinstance(ref, list) and len(ref) == 2]
+        if valid:
+            ud[key] = valid
 
 
 def _set_ui_message_id(context: ContextTypes.DEFAULT_TYPE, message_id: int) -> None:
     """Единственная точка записи UI_MESSAGE_ID_KEY — держит в паре память
     (context.user_data) и диск (переживает рестарт tt-bot)."""
     _ud(context)[UI_MESSAGE_ID_KEY] = message_id
-    _save_ui_message_id(message_id)
-
-
-def _restore_ui_message_id(app: Application) -> None:
-    saved = _load_ui_message_id()
-    if saved is not None:
-        app.user_data[ALLOWED_USER_ID][UI_MESSAGE_ID_KEY] = saved
+    _save_ui_state(context)
 
 
 BUSY_INFO: dict[str, Any] = {}
@@ -4363,7 +4388,7 @@ async def user_action_rotate_callback(update: Update, context: ContextTypes.DEFA
         parse_mode=ParseMode.HTML,
         reply_markup=rotate_password_back_kb(f"udev:{username}"),
     )
-    _ud(context).setdefault(ROTATE_SCAFFOLD_KEY, []).append((prompt.chat_id, prompt.message_id))
+    _track_rotate_scaffold_message(context, prompt)
     await _delete_callback_source_quiet(q)
 
 
@@ -4792,6 +4817,7 @@ async def _burn_scaffold(
     (если задан), пропустив `keep` — используется, когда затреканное
     сообщение сейчас не сгорает, а переиспользуется (edit) под другую карточку."""
     refs = list(_ud(context).pop(key, None) or [])
+    _save_ui_state(context)
     if extra is not None:
         refs.append((extra.chat_id, extra.message_id))
     keep_ref = (keep.chat_id, keep.message_id) if keep is not None else None
@@ -4821,11 +4847,13 @@ def _untrack_scaffold(context: ContextTypes.DEFAULT_TYPE, key: str, message: Mes
         _ud(context)[key] = remaining
     else:
         _ud(context).pop(key, None)
+    _save_ui_state(context)
 
 
 # Поиск пользователя
 def _track_user_search_message(context: ContextTypes.DEFAULT_TYPE, message: Message) -> None:
     _ud(context).setdefault(USER_SEARCH_SCAFFOLD_KEY, []).append((message.chat_id, message.message_id))
+    _save_ui_state(context)
 
 
 def user_search_cancel_kb() -> InlineKeyboardMarkup:
@@ -4844,6 +4872,7 @@ async def _cleanup_user_search_scaffold(
 # Добавление пользователя
 def _track_add_flow_message(context: ContextTypes.DEFAULT_TYPE, message: Message) -> None:
     _ud(context).setdefault(ADD_FLOW_SCAFFOLD_KEY, []).append((message.chat_id, message.message_id))
+    _save_ui_state(context)
 
 
 def add_username_cancel_kb() -> InlineKeyboardMarkup:
@@ -4860,6 +4889,11 @@ async def _cleanup_add_flow_scaffold(
 
 
 # Промпт смены пароля
+def _track_rotate_scaffold_message(context: ContextTypes.DEFAULT_TYPE, message: Message) -> None:
+    _ud(context).setdefault(ROTATE_SCAFFOLD_KEY, []).append((message.chat_id, message.message_id))
+    _save_ui_state(context)
+
+
 async def _cleanup_rotate_scaffold(bot, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _burn_scaffold(bot, context, ROTATE_SCAFFOLD_KEY)
 
@@ -4935,6 +4969,8 @@ async def add_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def add_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     assert message is not None
+    if not _ud(context).get("add_flow_active"):
+        return ConversationHandler.END
     _track_add_flow_message(context, message)
     password = (message.text or "").strip()
     username = _ud(context).get("pending_add_username", "")
@@ -5105,7 +5141,7 @@ async def rotate_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     )
     msg = _accessible(q.message)
     if msg:
-        _ud(context).setdefault(ROTATE_SCAFFOLD_KEY, []).append((msg.chat_id, msg.message_id))
+        _track_rotate_scaffold_message(context, msg)
 
 
 async def rotate_password_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6005,7 +6041,7 @@ def main():
         .defaults(Defaults(disable_notification=True))
         .build()
     )
-    _restore_ui_message_id(app)
+    _restore_ui_state(app)
     app.add_error_handler(log_unhandled_error)
 
     app.add_handler(MessageHandler(filters.Text(["🏠 Меню"]), allow_guard(menu_button_tap)), group=-1)

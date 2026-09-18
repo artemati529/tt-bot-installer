@@ -2,6 +2,7 @@
 
 
 def test_real_password_text_is_still_accepted(bot_tt, allowed_update, context, run_async):
+    context.user_data["add_flow_active"] = True
     context.user_data["pending_add_username"] = "newuser"
 
     update = allowed_update("hunter2-not-a-menu-button")
