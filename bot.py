@@ -128,10 +128,13 @@ from telegram import (
 
 try:
     from telegram import CopyTextButton
+    from telegram.constants import InlineKeyboardButtonLimit
 
+    MAX_COPY_TEXT_LEN: int = int(InlineKeyboardButtonLimit.MAX_COPY_TEXT)
     _HAS_COPY_TEXT = True
 except ImportError:
     CopyTextButton = None  # type: ignore[misc, assignment]
+    MAX_COPY_TEXT_LEN = 256
     _HAS_COPY_TEXT = False
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, TelegramError
@@ -160,6 +163,7 @@ warnings.filterwarnings(
 
 # Настройки
 ENV_PATH = Path(os.environ.get("TT_BOT_ENV_PATH", "/opt/tt-bot/.env"))
+UI_STATE_FILE = ENV_PATH.parent / "ui_state.json"
 TT_DIR = Path("/opt/trusttunnel")
 CRED_FILE = TT_DIR / "credentials.toml"
 RULES_FILE = TT_DIR / "rules.toml"
@@ -435,6 +439,38 @@ def is_message_not_modified(exc: BaseException) -> bool:
 
 
 UI_MESSAGE_ID_KEY = "ui_message_id"
+
+
+def _save_ui_message_id(message_id: int) -> None:
+    try:
+        UI_STATE_FILE.write_text(json.dumps({"ui_message_id": message_id}), encoding="utf-8")
+    except OSError as e:
+        logger.debug("Не удалось сохранить ui_message_id: %s", e)
+
+
+def _load_ui_message_id() -> int | None:
+    if not UI_STATE_FILE.exists():
+        return None
+    try:
+        value = json.loads(UI_STATE_FILE.read_text(encoding="utf-8")).get("ui_message_id")
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, int) else None
+
+
+def _set_ui_message_id(context: ContextTypes.DEFAULT_TYPE, message_id: int) -> None:
+    """Единственная точка записи UI_MESSAGE_ID_KEY — держит в паре память
+    (context.user_data) и диск (переживает рестарт tt-bot)."""
+    _ud(context)[UI_MESSAGE_ID_KEY] = message_id
+    _save_ui_message_id(message_id)
+
+
+def _restore_ui_message_id(app: Application) -> None:
+    saved = _load_ui_message_id()
+    if saved is not None:
+        app.user_data[ALLOWED_USER_ID][UI_MESSAGE_ID_KEY] = saved
+
+
 BUSY_INFO: dict[str, Any] = {}
 BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 
@@ -557,7 +593,7 @@ async def best_effort_edit(message, text: str, **kwargs) -> None:
 
 def _remember_ui_message(context: ContextTypes.DEFAULT_TYPE, message: Message | None) -> None:
     if message:
-        _ud(context)[UI_MESSAGE_ID_KEY] = message.message_id
+        _set_ui_message_id(context, message.message_id)
 
 
 async def _delete_message_quiet(message: Message | None) -> None:
@@ -624,7 +660,7 @@ async def upsert_ui_message(
         parse_mode=parse_mode,
         reply_markup=reply_markup,
     )
-    _ud(context)[UI_MESSAGE_ID_KEY] = msg.message_id
+    _set_ui_message_id(context, msg.message_id)
 
 
 def error_card(reason: str, what_next: str | None = None) -> str:
@@ -792,7 +828,7 @@ async def reply_deeplink_with_qr(
     if len(cap) > TG_CAPTION_SAFE:
         cap = cap[: TG_CAPTION_SAFE - 3] + "…"
     kb_rows: list[list[InlineKeyboardButton]] = [*(extra_rows or [])]
-    if _HAS_COPY_TEXT and CopyTextButton is not None:
+    if _HAS_COPY_TEXT and CopyTextButton is not None and len(deeplink) <= MAX_COPY_TEXT_LEN:
         kb_rows.append(
             [InlineKeyboardButton("📋 Копировать deeplink", copy_text=CopyTextButton(text=deeplink))]
         )
@@ -1037,8 +1073,15 @@ def run_process(
             except (ProcessLookupError, PermissionError):
                 pass
             proc.wait()
+            # killpg реально достаёт только процессы, оставшиеся в группе
+            # нашего прямого потомка — демонизирующийся скрипт, вызвавший
+            # setsid, специально из неё выходит и переживает SIGKILL,
+            # унаследованный pipe остаётся у него открытым. Тот же дедлайн,
+            # что и в успешной ветке — иначе именно тут таймаут перестаёт
+            # быть таймаутом.
+            join_deadline = monotonic() + 5
             for t in reader_threads:
-                t.join()
+                t.join(timeout=max(0.0, join_deadline - monotonic()))
             last_err = f"timeout after {timeout}s"
             if attempt < attempts:
                 continue
@@ -1522,14 +1565,17 @@ def _fetch_metrics_clients() -> list[dict[str, Any]] | None:
     return cached_compute("metrics_clients", MONITOR_CACHE_TTL_SEC, _produce)
 
 
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _parse_metric_item(item: dict[str, Any]) -> tuple[str, int]:
     """(username, sessions); sessions=0 если значение битое."""
     username = str(item.get("username") or "").strip()
-    try:
-        sessions = int(item.get("sessions") or 0)
-    except (TypeError, ValueError):
-        sessions = 0
-    return username, sessions
+    return username, _safe_int(item.get("sessions"))
 
 
 def _aggregate_sessions_from_metrics(
@@ -1550,8 +1596,8 @@ def _aggregate_sessions_from_metrics(
             continue
 
         ip_part = f" · {html_spoiler(str(ip))}" if ip else ""
-        inbound = _human_bytes(int(item.get("inbound") or 0))
-        outbound = _human_bytes(int(item.get("outbound") or 0))
+        inbound = _human_bytes(_safe_int(item.get("inbound")))
+        outbound = _human_bytes(_safe_int(item.get("outbound")))
         labels[key] = (
             f"🟢 <b>{html.escape(username)}</b>{ip_part}\n"
             f"    📥 <code>{inbound}</code> · 📤 <code>{outbound}</code>"
@@ -3562,7 +3608,11 @@ def _tt_install_sync(version: str) -> tuple[int, str, str]:
     ver = version.strip().lstrip("vV")
     tag = shlex.quote(version.strip())
     return run_shell(
-        f"curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/tags/{tag}/scripts/install.sh "
+        # pipefail: без него код возврата пайпа — это код sh (последнего в
+        # цепочке), а не curl. При сбое curl (сеть/DNS/rate-limit/битый тег)
+        # sh получает пустой stdin и молча выходит с 0 — апгрейд считался бы
+        # успешным, хотя ничего не установилось.
+        f"set -o pipefail; curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/tags/{tag}/scripts/install.sh "
         f"| sh -s -- -a y -V {shlex.quote(ver)}",
         timeout=1800,
         capture_limit=24000,
@@ -3942,7 +3992,7 @@ async def _navigate_inline(
             parse_mode=ParseMode.HTML,
             reply_markup=kb,
         )
-        _ud(context)[UI_MESSAGE_ID_KEY] = sent.message_id
+        _set_ui_message_id(context, sent.message_id)
         return
     _remember_ui_message(context, msg)
     await safe_edit_message_text(q, text, parse_mode=ParseMode.HTML, reply_markup=kb)
@@ -4499,25 +4549,43 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "nav:logs":
         await cb_answer(q)
-        text, chunk, total_chunks = await asyncio.to_thread(build_logs_view, "all", 50, 0)
-        await safe_edit_message_text(
-            q,
-            clip_text(text),
-            reply_markup=logs_inline_kb("all", 50, chunk, total_chunks),
-        )
+        try:
+            text, chunk, total_chunks = await asyncio.to_thread(build_logs_view, "all", 50, 0)
+            await safe_edit_message_text(
+                q,
+                clip_text(text),
+                reply_markup=logs_inline_kb("all", 50, chunk, total_chunks),
+            )
+        except Exception:
+            logger.exception("nav logs failed")
+            await safe_edit_message_text(
+                q,
+                error_card("Не удалось показать логи.", "проверь journalctl -u tt-bot и попробуй ещё раз"),
+                parse_mode=ParseMode.HTML,
+                reply_markup=server_hub_kb(),
+            )
         return
 
     if data == "nav:cert":
         await cb_answer(q)
-        text, _ = await asyncio.to_thread(
-            cached_compute, "cert_card", MONITOR_CACHE_TTL_SEC, get_cert_card_data
-        )
-        await safe_edit_message_text(
-            q,
-            clip_text(text),
-            parse_mode=ParseMode.HTML,
-            reply_markup=cert_card_inline_kb(),
-        )
+        try:
+            text, _ = await asyncio.to_thread(
+                cached_compute, "cert_card", MONITOR_CACHE_TTL_SEC, get_cert_card_data
+            )
+            await safe_edit_message_text(
+                q,
+                clip_text(text),
+                parse_mode=ParseMode.HTML,
+                reply_markup=cert_card_inline_kb(),
+            )
+        except Exception:
+            logger.exception("nav cert failed")
+            await safe_edit_message_text(
+                q,
+                error_card("Не удалось показать карточку сертификата.", "проверь journalctl -u tt-bot и попробуй ещё раз"),
+                parse_mode=ParseMode.HTML,
+                reply_markup=server_hub_kb(),
+            )
         return
 
     # Неизвестный nav:* (например, кнопка из старой версии карточки) — иначе
@@ -5374,6 +5442,7 @@ async def restart_tt_confirm_callback(update: Update, context: ContextTypes.DEFA
         return
     await cb_answer(q, "Перезапуск…", alert=True)
     await safe_edit_message_text(q, "⏳ Перезапускаю <b>trusttunnel</b>…", parse_mode=ParseMode.HTML)
+    busy_set("перезапуск trusttunnel")
     try:
         await asyncio.to_thread(apply_tt_config_change)
         await safe_edit_message_text(q,
@@ -5389,6 +5458,8 @@ async def restart_tt_confirm_callback(update: Update, context: ContextTypes.DEFA
             parse_mode=ParseMode.HTML,
             reply_markup=hub_inline_kb(),
         )
+    finally:
+        busy_clear()
 
 
 def _undo_rotate_password_sync(username: str, old_password: str) -> bool:
@@ -5416,11 +5487,16 @@ async def _undo_rotate_password(q, payload: dict[str, Any]) -> None:
         await cb_answer(q, f"Пользователь {username} не найден", alert=True)
         return
     await cb_answer(q, "Пароль возвращён", alert=True)
-    await q.edit_message_caption(
-        caption=f"↩️ Пароль <code>{html.escape(username)}</code> возвращён к предыдущему.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=hub_inline_kb(),
-    )
+    # Пароль уже откачен на диске и в сервисе — падение здесь (сообщение
+    # успели удалить) не должно читаться как "отмена не удалась".
+    try:
+        await q.edit_message_caption(
+            caption=f"↩️ Пароль <code>{html.escape(username)}</code> возвращён к предыдущему.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=hub_inline_kb(),
+        )
+    except Exception as e:
+        logger.debug("Не удалось обновить подпись QR после undo-rotate: %s", e)
 
 
 async def _undo_delete_user(q, payload: dict[str, Any]) -> None:
@@ -5929,6 +6005,7 @@ def main():
         .defaults(Defaults(disable_notification=True))
         .build()
     )
+    _restore_ui_message_id(app)
     app.add_error_handler(log_unhandled_error)
 
     app.add_handler(MessageHandler(filters.Text(["🏠 Меню"]), allow_guard(menu_button_tap)), group=-1)

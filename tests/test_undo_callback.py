@@ -27,6 +27,29 @@ def test_undo_rotate_password_restores_old_password(
     assert "new-pass" not in text
 
 
+def test_undo_rotate_password_reports_success_even_if_caption_edit_fails(
+    bot_tt, tt_paths, allowed_callback_update, context, run_async, monkeypatch,
+):
+    """The password was already rolled back on disk+service by the time
+    edit_message_caption runs — if that QR message was since deleted, the
+    caption update failing must not make undo_callback's outer except think
+    the whole undo failed (it already succeeded)."""
+    (tt_paths["CRED_FILE"]).write_text(
+        '[[client]]\nusername = "alice"\npassword = "new-pass"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(bot_tt, "apply_tt_config_change", lambda **k: "restart")
+    bot_tt._set_pending_undo(context, "rotate_password", {"username": "alice", "old_password": "old-pass"})
+
+    update = allowed_callback_update("undo:go")
+    update.callback_query.edit_message_caption = AsyncMock(side_effect=RuntimeError("message to edit not found"))
+    run_async(bot_tt.undo_callback(update, context))
+
+    text = (tt_paths["CRED_FILE"]).read_text(encoding="utf-8")
+    assert "old-pass" in text
+    toast = update.callback_query.answer.call_args.kwargs.get("text") or ""
+    assert "не удалось отменить" not in toast.lower()
+
+
 def test_undo_delete_user_recreates_user(
     bot_tt, tt_paths, allowed_callback_update, context, run_async, monkeypatch,
 ):

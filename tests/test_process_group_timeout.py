@@ -43,6 +43,29 @@ def test_run_process_capture_limit_does_not_wait_on_grandchild_pipe(bot_tt):
     assert elapsed < 8, f"run_process blocked {elapsed:.2f}s waiting on a grandchild-held pipe"
 
 
+def test_timeout_path_does_not_wait_on_setsid_grandchild_pipe(bot_tt):
+    """Same pipe-holding-grandchild issue as the success path above, but in
+    the TimeoutExpired branch: killpg only reaches processes still in the
+    child's process group, and a properly daemonizing script typically calls
+    setsid to escape it on purpose — so SIGKILL doesn't touch it, it keeps
+    the inherited pipe open, and the unbounded t.join() here blocks for as
+    long as that grandchild lives, defeating the very timeout that was just
+    enforced. Reproduced live: a setsid'd `sleep 20` blocked this for the
+    full 20s before the fix."""
+    start = time.monotonic()
+    with pytest.raises(bot_tt.CommandError):
+        bot_tt.run_process(
+            ["bash", "-c", "setsid sleep 20 & sleep 100"],
+            timeout=1,
+            retries=0,
+            check=False,
+            capture_limit=1000,
+        )
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 8, f"timeout path blocked {elapsed:.2f}s waiting on a setsid'd grandchild"
+
+
 def test_run_process_capture_limit_keeps_only_output_tail(bot_tt):
     p = bot_tt.run_process(
         ["bash", "-lc", "printf BEGIN; head -c 5000 /dev/zero | tr '\\0' x; printf END"],
