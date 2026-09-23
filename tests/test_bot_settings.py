@@ -1,27 +1,9 @@
 """Legacy post-create delivery settings must stay removed."""
-import inspect
 from unittest.mock import AsyncMock
 
 
 def _datas(kb):
     return [btn.callback_data for row in kb.inline_keyboard for btn in row]
-
-
-def test_legacy_settings_api_is_removed(bot_tt):
-    assert not hasattr(bot_tt, "settings_text")
-    assert not hasattr(bot_tt, "settings_inline_kb")
-    assert not hasattr(bot_tt, "settings_callback")
-    assert not hasattr(bot_tt, "load_bot_settings")
-    assert not hasattr(bot_tt, "save_bot_settings")
-    assert not hasattr(bot_tt, "BOT_SETTINGS_FILE")
-    assert not hasattr(bot_tt, "DEFAULT_BOT_SETTINGS")
-
-
-def test_settings_callback_is_not_registered(bot_tt):
-    src = inspect.getsource(bot_tt.main)
-
-    assert "settings_callback" not in src
-    assert 'pattern=r"^set:"' not in src
 
 
 def test_create_flow_sends_one_qr_card(

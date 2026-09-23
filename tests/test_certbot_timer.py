@@ -40,8 +40,8 @@ def _patch(
     if show_out is None:
         show_out = SHOW_OUTPUT_ACTIVE
 
-    def fake_run_shell(command, timeout=None, **kwargs):
-        if command.startswith("systemctl show certbot.timer"):
+    def fake_run_argv(cmd, timeout=None, **kwargs):
+        if cmd[:3] == ["systemctl", "show", "certbot.timer"]:
             return run_shell_code, show_out, ""
         return 0, "", ""
 
@@ -52,7 +52,7 @@ def _patch(
             return "active"
         return ""
 
-    monkeypatch.setattr(bot_tt, "run_shell", fake_run_shell)
+    monkeypatch.setattr(bot_tt, "run_argv", fake_run_argv)
     monkeypatch.setattr(bot_tt, "run_cmd", fake_run_cmd)
 
 
@@ -117,7 +117,7 @@ def test_timer_inactive_flagged(bot_tt, monkeypatch):
         "ActiveState=inactive"
     )
     monkeypatch.setattr(
-        bot_tt, "run_shell", lambda c, timeout=None, **kw: (0, show_out, "")
+        bot_tt, "run_argv", lambda c, timeout=None, **kw: (0, show_out, "")
     )
 
     def fake_run_cmd(cmd, timeout=None, **kwargs):
@@ -137,7 +137,7 @@ def test_timer_inactive_flagged(bot_tt, monkeypatch):
 def test_list_timers_runs_with_c_locale(bot_tt, monkeypatch):
     seen = []
     monkeypatch.setattr(
-        bot_tt, "run_shell", lambda c, timeout=None, **kw: (0, SHOW_OUTPUT_ACTIVE, "")
+        bot_tt, "run_argv", lambda c, timeout=None, **kw: (0, SHOW_OUTPUT_ACTIVE, "")
     )
 
     def fake_run_cmd(cmd, timeout=None, **kwargs):

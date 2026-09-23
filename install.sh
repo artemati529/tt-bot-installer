@@ -12,8 +12,64 @@ TT_DIR="/opt/trusttunnel"
 BOT_DIR="/opt/tt-bot"
 TT_BOT_REPO_RAW="${TT_BOT_REPO_RAW:-https://raw.githubusercontent.com/artemati529/tt-bot-installer/main}"
 
-log()  { echo "==> $*"; }
-die()  { echo "ERROR: $*" >&2; exit 1; }
+log() { echo "==> $*"; }
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+# .env с BOT_TOKEN: mktemp создаёт файл сразу 0600 — ни мгновения не читаем
+# всеми (в отличие от `> .env` с umask 022 и chmod следом), а mv атомарен.
+# При повторном запуске прежний .env сохраняется как .env.bak-<дата> (0600),
+# а ключи, которые установщик не спрашивает (BACKUP_KEEP_*, BOT_LOCK_PATH,
+# METRICS_CLIENTS_URL, комментарии), переносятся в новый файл как есть.
+write_env_file() {
+    local tmp env="$BOT_DIR/.env"
+    local managed='^(BOT_TOKEN|ALLOWED_USER_ID|ENDPOINT_ADDRESS|SERVER_NAME|VPN_MONITOR_PORT)='
+    tmp="$(mktemp "$BOT_DIR/.env.XXXXXX")"
+    {
+        printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN"
+        printf 'ALLOWED_USER_ID=%s\n' "$ALLOWED_USER_ID"
+        printf 'ENDPOINT_ADDRESS=%s\n' "$ENDPOINT_ADDRESS"
+        printf 'SERVER_NAME=%s\n' "$SERVER_NAME"
+        printf 'VPN_MONITOR_PORT=%s\n' "$VPN_MONITOR_PORT"
+        if [[ -f "$env" ]]; then
+            grep -Ev "$managed" "$env" || true
+        fi
+    } > "$tmp"
+    chmod 600 "$tmp"
+    if [[ -f "$env" ]]; then
+        cp -p "$env" "$env.bak-$(date +%Y%m%d-%H%M%S)"
+        chmod 600 "$env.bak-"*
+    fi
+    mv -f "$tmp" "$env"
+}
+
+# Подсказки из hosts.toml/vpn.toml или пусто. `|| true` обязателен: grep
+# без совпадений + pipefail дают ненулевой код подстановки, и set -e молча
+# завершал установщик сразу после ввода токена.
+guess_hostname() {
+    grep -oP '^\s*hostname\s*=\s*"\K[^"]+' "$TT_DIR/hosts.toml" 2>/dev/null | head -1 || true
+}
+
+guess_listen_port() {
+    grep -oP '^\s*listen_address\s*=\s*"[^"]*:\K[0-9]+' "$TT_DIR/vpn.toml" 2>/dev/null | head -1 || true
+}
+
+guess_endpoint_address() {
+    local host port
+    host="$(guess_hostname)"
+    port="$(guess_listen_port)"
+    if [[ -n "$host" && -n "$port" ]]; then
+        printf '%s:%s\n' "$host" "$port"
+    fi
+}
+
+# Всё исполняемое — внутри main, вызов в последней строке файла: при
+# `curl | bash` оборванная загрузка не выполнит полскрипта. Тело без
+# отступа намеренно — heredoc'ам ниже нужен EOF с нулевой колонки.
+main() {
 
 # ---------------------------------------------------------------------------
 # 0. Preconditions
@@ -57,10 +113,8 @@ echo
 read -rp "Your Telegram numeric user id (ALLOWED_USER_ID, see @userinfobot): " ALLOWED_USER_ID < /dev/tty
 [[ "$ALLOWED_USER_ID" =~ ^[0-9]+$ ]] || die "ALLOWED_USER_ID must be numeric."
 
-HOSTNAME_GUESS="$(grep -oP '^\s*hostname\s*=\s*"\K[^"]+' "$TT_DIR/hosts.toml" 2>/dev/null | head -1)"
-PORT_GUESS="$(grep -oP '^\s*listen_address\s*=\s*"[^"]*:\K[0-9]+' "$TT_DIR/vpn.toml" 2>/dev/null | head -1)"
-ADDRESS_GUESS=""
-[[ -n "$HOSTNAME_GUESS" && -n "$PORT_GUESS" ]] && ADDRESS_GUESS="${HOSTNAME_GUESS}:${PORT_GUESS}"
+HOSTNAME_GUESS="$(guess_hostname)"
+ADDRESS_GUESS="$(guess_endpoint_address)"
 
 read -rp "VPN endpoint address, host:port${ADDRESS_GUESS:+ [$ADDRESS_GUESS]}: " ENDPOINT_ADDRESS < /dev/tty
 ENDPOINT_ADDRESS="${ENDPOINT_ADDRESS:-$ADDRESS_GUESS}"
@@ -166,14 +220,7 @@ python3 -m venv "$BOT_DIR/.venv"
 cp "$SCRIPT_DIR/bot.py" "$BOT_DIR/bot.py"
 chmod 700 "$BOT_DIR/bot.py"
 
-{
-    printf 'BOT_TOKEN=%s\n' "$BOT_TOKEN"
-    printf 'ALLOWED_USER_ID=%s\n' "$ALLOWED_USER_ID"
-    printf 'ENDPOINT_ADDRESS=%s\n' "$ENDPOINT_ADDRESS"
-    printf 'SERVER_NAME=%s\n' "$SERVER_NAME"
-    printf 'VPN_MONITOR_PORT=%s\n' "$VPN_MONITOR_PORT"
-} > "$BOT_DIR/.env"
-chmod 600 "$BOT_DIR/.env"
+write_env_file
 
 # ---------------------------------------------------------------------------
 # 4. systemd — tt-bot.service
@@ -200,7 +247,10 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now tt-bot.service
+systemctl enable tt-bot.service
+# restart, а не `enable --now`: на уже работающем юните --now — no-op, и
+# при повторном запуске новый bot.py/.env не подхватились бы.
+systemctl restart tt-bot.service
 
 sleep 2
 systemctl is-active --quiet tt-bot.service || die "tt-bot.service failed to start — check: journalctl -u tt-bot -n 50"
@@ -215,3 +265,6 @@ echo "============================================================"
 echo "Bot installed at ${BOT_DIR}, running as tt-bot.service."
 echo "Follow logs: journalctl -u tt-bot -f"
 echo "Open the bot in Telegram and use /start."
+}
+
+main "$@"

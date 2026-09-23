@@ -67,7 +67,11 @@ cd tt-bot-installer
 - ставит зависимости из `requirements.txt` (версии зафиксированы);
 - копирует `bot.py` в `/opt/tt-bot/bot.py` (0700);
 - пишет `/opt/tt-bot/.env` (0600) с введёнными значениями;
-- создаёт и включает `tt-bot.service` (systemd).
+- создаёт, включает и (пере)запускает `tt-bot.service` (systemd).
+
+Повторный запуск безопасен: прежний `.env` сохраняется как `.env.bak-<дата>`,
+ключи, которые установщик не спрашивает (`BACKUP_KEEP_*`, `BOT_LOCK_PATH`,
+`METRICS_CLIENTS_URL`), переносятся, бот перезапускается с новым `bot.py`.
 
 ## Обновление бота на сервере
 
@@ -84,7 +88,7 @@ pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
 
-Полное покрытие `bot.py` (число тестов растёт — точное см. в выводе `pytest`), чистые mypy/ruff/pyflakes.
+Покрытие `bot.py` — около 80% строк (точное: `pytest --cov=. tests/`), чистые mypy/ruff/pyflakes.
 
 ## Файлы
 

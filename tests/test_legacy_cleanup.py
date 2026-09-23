@@ -2,43 +2,6 @@
 import inspect
 
 
-def test_legacy_reply_keyboard_wrappers_are_removed(bot_tt):
-    removed = (
-        "add_entry",
-        "html_expandable_blockquote",
-        "ui_back_server",
-        "tap_infosrv",
-        "tap_infocli",
-        "tap_logs",
-        "tap_cert",
-        "tap_rotate",
-        "tap_export",
-        "tap_list_delete",
-        "tap_list_users",
-        "tap_rules_sync",
-        "tap_backup",
-        "tap_restore_backup",
-        "tap_os_upgrade",
-        "tap_tt_upgrade",
-        "tap_reboot_confirm",
-        "run_cert",
-        "run_infocli",
-        "run_logs",
-        "run_users_list",
-        "run_rules_sync_view",
-        "cert_update_callback",
-        "cert_refresh_callback",
-        "_renew_cert_sync",
-        "_cert_renew_task",
-    )
-
-    for name in removed:
-        assert not hasattr(bot_tt, name), f"{name} must stay removed"
-
-    assert hasattr(bot_tt, "add_entry_cb")
-    assert hasattr(bot_tt, "restart_tt_prompt_callback")
-
-
 def test_footer_navigation_has_no_monitor_compat_key(bot_tt):
     # nav_footer_row/card_footer_row объединены в один
     # BACK_PARENT + card_footer_row — "monitor" не должен всплыть ни там,

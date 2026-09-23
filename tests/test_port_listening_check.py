@@ -41,10 +41,11 @@ def test_info_card_includes_port_check(bot_tt, monkeypatch):
 
 
 def test_info_card_is_compact_health_card_without_debug_diag_or_swap(bot_tt, monkeypatch):
+    def fake_service_state(unit, *args, **kwargs):
+        return "failed" if unit == "tt-bot.service" else "active"
+
     def fake_run_cmd(cmd, *args, **kwargs):
-        if cmd[:2] == ["systemctl", "is-active"]:
-            return "failed" if cmd[-1] == "tt-bot.service" else "active"
-        if cmd and cmd[0] == "bash" and "ss -ltn" in cmd[-1]:
+        if cmd[:2] == ["ss", "-ltn"]:
             return LISTEN_OUTPUT
         return ""
 
@@ -52,7 +53,9 @@ def test_info_card_is_compact_health_card_without_debug_diag_or_swap(bot_tt, mon
         raise AssertionError("Диагностика не должна читать journalctl")
 
     monkeypatch.setattr(bot_tt, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr(bot_tt, "service_state", fake_service_state)
     monkeypatch.setattr(bot_tt, "run_shell", fail_run_shell)
+    monkeypatch.setattr(bot_tt, "run_argv", fail_run_shell)
     monkeypatch.setattr(bot_tt.os, "getloadavg", lambda: (0.12, 0.08, 0.05))
     monkeypatch.setattr(bot_tt, "_uptime_pretty", lambda: "up 2 days, 3 hours")
     monkeypatch.setattr(bot_tt, "parse_meminfo", lambda: {"MemTotal": 1024 * 1000, "MemAvailable": 1024 * 512})

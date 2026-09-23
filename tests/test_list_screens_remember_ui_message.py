@@ -35,7 +35,7 @@ def test_users_filter_callback_remembers_its_message(bot_tt, allowed_callback_up
 
 
 def test_clients_page_callback_remembers_its_message(bot_tt, allowed_callback_update, context, run_async, monkeypatch):
-    monkeypatch.setattr(bot_tt, "clients_card_html", lambda page: ("<b>x</b>", 1, [], False))
+    monkeypatch.setattr(bot_tt, "clients_card_html", lambda page: ("<b>x</b>", 1))
     context.user_data[bot_tt.UI_MESSAGE_ID_KEY] = 999
     update = allowed_callback_update("ss:0")
     update.callback_query.message.message_id = 44

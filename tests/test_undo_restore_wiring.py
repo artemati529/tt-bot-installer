@@ -1,6 +1,8 @@
 """restore_backup_callback (resdo:) должен захватить содержимое файла ДО
 восстановления и повесить кнопку «Отменить» — только для одиночного файла,
 не для resdo:__all__."""
+import hashlib
+import re
 
 
 def test_resdo_single_file_sets_pending_undo(bot_tt, tt_paths, allowed_callback_update, context, run_async, monkeypatch):
@@ -16,11 +18,21 @@ def test_resdo_single_file_sets_pending_undo(bot_tt, tt_paths, allowed_callback_
     run_async(bot_tt.restore_backup_callback(update, context))
 
     info = bot_tt._pop_pending_undo(context)
-    assert info == {"kind": "restore_file", "payload": {"filename": "vpn.toml", "data": b"live-changed\n", "mode": info["payload"]["mode"]}}
+    assert info == {
+        "kind": "restore_file",
+        "payload": {
+            "filename": "vpn.toml",
+            "data": b"live-changed\n",
+            "mode": info["payload"]["mode"],
+            # sha восстановленного содержимого — чтобы отмена не затёрла правки после.
+            "restored_sha256": hashlib.sha256(b"live-before\n").hexdigest(),
+        },
+    }
 
     kb = update.callback_query.edit_message_text.call_args.kwargs["reply_markup"]
     buttons = [b.callback_data for row in kb.inline_keyboard for b in row]
-    assert "undo:go" in buttons
+    # Кнопка несёт токен своего действия, а не общий undo:go.
+    assert any(re.fullmatch(r"undo:[0-9a-f]{8}", b or "") for b in buttons)
 
 
 def test_resdo_all_does_not_set_pending_undo(bot_tt, tt_paths, allowed_callback_update, context, run_async, monkeypatch):

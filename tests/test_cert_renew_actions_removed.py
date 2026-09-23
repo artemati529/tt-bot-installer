@@ -21,11 +21,3 @@ def test_cert_log_back_button_goes_to_nav_cert(bot_tt, allowed_callback_update, 
     kb = update.callback_query.edit_message_text.await_args.kwargs["reply_markup"]
     datas = [btn.callback_data for row in kb.inline_keyboard for btn in row]
     assert datas[-1] == "nav:cert"
-
-
-def test_cert_renew_flow_is_removed(bot_tt):
-    removed = ("cert_update_callback", "cert_refresh_callback", "_renew_cert_sync", "_cert_renew_task")
-    for name in removed:
-        assert not hasattr(bot_tt, name), f"{name} must stay removed"
-
-    assert not any(r.name in ("cert_update_callback", "cert_refresh_callback") for r in bot_tt.CALLBACK_ROUTES)

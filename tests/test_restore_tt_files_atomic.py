@@ -25,3 +25,15 @@ def test_restore_tt_files_preserves_original_mode(bot_tt, tmp_path):
 
     assert f.read_text(encoding="utf-8") == "old content"
     assert oct(f.stat().st_mode)[-3:] == "600"
+
+
+def test_snapshot_roundtrips_non_utf8_bytes(bot_tt, tmp_path):
+    """Снапшот читал текст в UTF-8: файл с чужими байтами ронял сам снимок
+    (UnicodeDecodeError) — и откат не мог начаться. Снимок — байты."""
+    f = tmp_path / "rules.toml"
+    raw = b"# \xff\xfe legacy\n"
+    f.write_bytes(raw)
+    snapshot = bot_tt._snapshot_tt_files([f])
+    f.write_bytes(b"changed\n")
+    bot_tt._restore_tt_files(snapshot)
+    assert f.read_bytes() == raw

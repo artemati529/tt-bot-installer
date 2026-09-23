@@ -64,7 +64,8 @@ CALLBACK_DATA REGISTRY (префикс → что открывает; полна
                                (QR/TOML/ссылка/всё сразу/ротация/удаление)
   rulesync:clean|repair|view — синхронизация rules.toml
   logf:*                     — фильтр лога (level:lines:chunk)
-  undo:go                    — отмена последнего delete/rotate/restore
+  undo:<token>               — отмена своего delete/rotate/restore (токен
+                               связывает кнопку с действием; legacy undo:go)
 
 _SYNC КОНВЕНЦИЯ: суффикс _sync = функция блокирующая, вызывать только через
 asyncio.to_thread. Не добавлять суффикс доменным функциям про файлы/данные
@@ -79,12 +80,14 @@ import datetime as dt
 import difflib
 import fcntl
 import functools
+import hashlib
 import html
 import io
 import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -174,10 +177,21 @@ CERT_RENEW_SCRIPT = TT_DIR / "renew_trusttunnel_cert.sh"
 LE_CERT_BASE_DIR = Path("/etc/letsencrypt/live")
 LE_LOG_FILE = Path("/var/log/letsencrypt/letsencrypt.log")
 SERVICE_NAME = "trusttunnel.service"
-# Username укладывается в текст inline-кнопки (лимит Telegram 64 байта).
+# Лимит callback_data у Telegram — 64 БАЙТА: самый длинный префикс
+# «expproto:quic:» (14) + имя ≤ 50 байт. Считать в байтах, не в символах:
+# кириллица из вручную правленного credentials.toml — 2 байта на букву.
 MAX_USERNAME_LEN = 50
 TG_CAPTION_SAFE = 900
-BACKUP_FILES = ["vpn.toml", "hosts.toml", "credentials.toml", "rules.toml"]
+# Карта префиксов и профили — вместе с credentials/rules: без них после
+# «Восстановить всё» правила восстановленных юзеров становятся сиротами.
+BACKUP_FILES = [
+    "vpn.toml",
+    "hosts.toml",
+    "credentials.toml",
+    "rules.toml",
+    "user_prefix_map.toml",
+    "user_profiles.json",
+]
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -221,6 +235,20 @@ CALLBACK_ROUTES_WITH_USER_ARGS = {
 }
 
 
+def _parse_toml(text: str) -> Any:
+    """tomlkit.parse, у которого любая ошибка разбора — ValueError.
+
+    ParseError и так ValueError, а KeyAlreadyPresent (дубль ключа) — нет:
+    без этого все `except ValueError` вокруг разбора его пропускали.
+    """
+    try:
+        return tomlkit.parse(text)
+    except tomlkit.exceptions.TOMLKitError as e:
+        if isinstance(e, ValueError):
+            raise
+        raise ValueError(str(e)) from e
+
+
 def load_env(path: Path) -> dict:
     env = {}
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -228,7 +256,11 @@ def load_env(path: Path) -> dict:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        env[k.strip()] = v.strip()
+        v = v.strip()
+        # KEY="value" / KEY='value' при ручной правке .env — снимаем парные кавычки.
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        env[k.strip()] = v
     return env
 
 
@@ -298,7 +330,7 @@ def _detect_tt_listen_port() -> int | None:
     if not vpn_path.exists():
         return None
     try:
-        doc = tomlkit.parse(vpn_path.read_text(encoding="utf-8"))
+        doc = _parse_toml(vpn_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     listen = str(doc.get("listen_address", "")).strip()
@@ -322,7 +354,9 @@ if not ADDRESS:
 
 
 def acquire_runtime_lock():
-    lock_file = BOT_LOCK_PATH.open("w", encoding="utf-8")
+    # "a", а не "w": "w" обрезает файл ДО flock, и второй экземпляр стирал
+    # PID работающего. Обрезаем только после захвата блокировки.
+    lock_file = BOT_LOCK_PATH.open("a", encoding="utf-8")
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as e:
@@ -330,6 +364,7 @@ def acquire_runtime_lock():
         raise RuntimeError(
             f"tt-bot уже запущен: lock занят ({BOT_LOCK_PATH})"
         ) from e
+    lock_file.truncate(0)
     lock_file.write(f"{os.getpid()}\n")
     lock_file.flush()
     return lock_file
@@ -428,10 +463,59 @@ CLIP_TEXT_LIMIT = 3800
 CLIP_TEXT_LIMIT_IN_BLOCKQUOTE = 3500  # запас под <blockquote>/<pre>-обвязку и остальной текст карточки
 
 
+CLIP_TEXT_SUFFIX = "\n\n...output truncated"
+_CLIP_TAG_RE = re.compile(r"<(/?)([a-z][a-z0-9-]*)[^<>]*>", re.IGNORECASE)
+# Теги Telegram HTML — только их считаем разметкой; «<empty>» в логах — текст.
+_TG_HTML_TAGS = frozenset(
+    {"b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "a", "code", "pre", "blockquote", "tg-spoiler", "span"}
+)
+
+
+def _clip_cut_point(text: str, end: int) -> int:
+    """Отступить от end, чтобы не резать внутри тега <...> или entity &...;."""
+    lt = text.rfind("<", 0, end)
+    if lt > text.rfind(">", 0, end):
+        end = lt
+    amp = text.rfind("&", 0, end)
+    if amp != -1 and ";" not in text[amp:end] and end - amp <= 10:
+        end = amp
+    return end
+
+
+def _clip_closing_tags(head: str) -> str:
+    stack: list[str] = []
+    for m in _CLIP_TAG_RE.finditer(head):
+        closing, name = m.group(1), m.group(2).lower()
+        if name not in _TG_HTML_TAGS:
+            continue
+        if not closing:
+            stack.append(name)
+        elif name in stack:
+            while stack and stack.pop() != name:
+                pass
+    return "".join(f"</{name}>" for name in reversed(stack))
+
+
+def _html_visible_len(text: str) -> int:
+    """Длина текста так, как её считает Telegram после разбора HTML-entities."""
+    return len(html.unescape(re.sub(r"<[^>]+>", "", text)))
+
+
 def clip_text(text: str, limit: int = CLIP_TEXT_LIMIT) -> str:
+    """Обрезка под лимит Telegram, не ломающая HTML: не режет внутри тега
+    или entity и закрывает оставшиеся открытыми теги (иначе BadRequest
+    «can't parse entities» и сообщение не уходит вовсе)."""
     if len(text) <= limit:
         return text
-    return text[: limit - 20] + "\n\n...output truncated"
+    end = limit - len(CLIP_TEXT_SUFFIX)
+    while end > 0:
+        end = _clip_cut_point(text, end)
+        head = text[:end]
+        closers = _clip_closing_tags(head)
+        if len(head) + len(closers) + len(CLIP_TEXT_SUFFIX) <= limit:
+            return head + closers + CLIP_TEXT_SUFFIX
+        end -= len(closers)
+    return CLIP_TEXT_SUFFIX[:limit]
 
 
 def is_message_not_modified(exc: BaseException) -> bool:
@@ -457,7 +541,9 @@ def _save_ui_state(context: ContextTypes.DEFAULT_TYPE) -> None:
         if refs:
             state[key] = [list(ref) for ref in refs]
     try:
-        UI_STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+        # Атомарно: write_text обрезает файл до записи, и смерть процесса
+        # посреди неё оставляла пустой JSON — ссылки на scaffold терялись.
+        _atomic_write_bytes(UI_STATE_FILE, json.dumps(state).encode("utf-8"))
     except (OSError, TypeError) as e:
         logger.debug("Не удалось сохранить состояние UI: %s", e)
 
@@ -503,19 +589,34 @@ UNDO_TTL_SEC = 300
 PENDING_UNDO_KEY = "pending_undo"
 
 
-def _set_pending_undo(context: ContextTypes.DEFAULT_TYPE, kind: str, payload: dict[str, Any]) -> None:
-    _ud(context)[PENDING_UNDO_KEY] = {"kind": kind, "payload": payload, "at": monotonic()}
+def _set_pending_undo(context: ContextTypes.DEFAULT_TYPE, kind: str, payload: dict[str, Any]) -> str:
+    """Слот один, но у каждой отмены свой токен: кнопка несёт его в
+    callback_data, и «Отменить» под старым сообщением не отменит чужое,
+    более новое действие. Возвращает токен для _with_undo_row."""
+    token = secrets.token_hex(4)
+    _ud(context)[PENDING_UNDO_KEY] = {"kind": kind, "payload": payload, "at": monotonic(), "token": token}
+    return token
 
 
-def _pop_pending_undo(context: ContextTypes.DEFAULT_TYPE) -> dict[str, Any] | None:
-    info = _ud(context).pop(PENDING_UNDO_KEY, None)
+def _pop_pending_undo(context: ContextTypes.DEFAULT_TYPE, token: str | None = None) -> dict[str, Any] | None:
+    """token=None — без проверки (legacy undo:go и тесты); несовпадение
+    токена слот НЕ тратит — кнопка под последним действием остаётся живой."""
+    ud = _ud(context)
+    info = ud.get(PENDING_UNDO_KEY)
+    if info and token is not None and info.get("token") != token:
+        return None
+    ud.pop(PENDING_UNDO_KEY, None)
     if not info or monotonic() - info["at"] > UNDO_TTL_SEC:
         return None
     return {"kind": info["kind"], "payload": info["payload"]}
 
 
-def _with_undo_row(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Отменить", callback_data="undo:go")], *kb.inline_keyboard])
+def _undo_button(token: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton("↩️ Отменить", callback_data=f"undo:{token}")
+
+
+def _with_undo_row(kb: InlineKeyboardMarkup, token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[_undo_button(token)], *kb.inline_keyboard])
 
 
 BUSY_MARKER_FILE = TT_DIR / ".tt-bot-busy"
@@ -841,17 +942,19 @@ async def reply_deeplink_with_qr(
     if include_service:
         # systemctl живёт за пределами event loop — иначе зависший вызов
         # заморозит бота на весь timeout.
-        svc = await asyncio.to_thread(run_cmd, ["systemctl", "is-active", SERVICE_NAME]) or "unknown"
+        svc = await asyncio.to_thread(service_state, SERVICE_NAME)
         lines.append(f"Сервис: <code>{html.escape(svc)}</code>")
     # Ссылка несёт credential (deeplink целиком) в query — под спойлером,
     # как и текстовая выдача deeplink (см. deeplink_spoiler_html).
-    cap = (
-        "\n".join(lines)
-        + "\n\n"
-        f"<tg-spoiler><a href=\"{html.escape(qr_url)}\">Открыть deeplink trusttunnel.org/qr</a></tg-spoiler>"
-    )
-    if len(cap) > TG_CAPTION_SAFE:
-        cap = cap[: TG_CAPTION_SAFE - 3] + "…"
+    link = f"<tg-spoiler><a href=\"{html.escape(qr_url)}\">Открыть deeplink trusttunnel.org/qr</a></tg-spoiler>"
+    header = "\n".join(lines)
+    # Лимит подписи Telegram считается ПОСЛЕ разбора entities: href в него не
+    # входит, поэтому длинный deeplink не повод резать. Если видимый текст
+    # всё же длинный — сокращаем заголовок (HTML-безопасно), ссылку не трогаем.
+    budget = TG_CAPTION_SAFE - _html_visible_len(link) - 2
+    if _html_visible_len(header) > budget:
+        header = clip_text(header, max(0, budget))
+    cap = header + "\n\n" + link
     kb_rows: list[list[InlineKeyboardButton]] = [*(extra_rows or [])]
     if _HAS_COPY_TEXT and CopyTextButton is not None and len(deeplink) <= MAX_COPY_TEXT_LEN:
         kb_rows.append(
@@ -1058,6 +1161,7 @@ def run_process(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=capture_limit is None,
+            errors="replace" if capture_limit is None else None,
             cwd=str(cwd) if cwd else None,
             start_new_session=True,
         )
@@ -1125,7 +1229,8 @@ def run_process(
 def run_cmd(cmd: list[str], timeout: int = 20) -> str:
     try:
         return run_process(cmd, timeout=timeout, retries=1, check=True).stdout.strip()
-    except CommandError as e:
+    except (CommandError, OSError) as e:
+        # OSError — бинарника нет/не исполняемый (Popen бросает до запуска).
         # "" по-прежнему возвращаем (вызывающие оперются на `or "unknown"`),
         # но причину фиксируем в journalctl — «unknown» в карточке становится
         # диагностируемым, а не глотается молча. WARNING (а не DEBUG): логгер
@@ -1133,6 +1238,32 @@ def run_cmd(cmd: list[str], timeout: int = 20) -> str:
         # (systemctl/ss/…); на healthy-сервисе ошибок нет → шума не будет.
         logger.warning("run_cmd failed: %s: %s", " ".join(cmd), e)
         return ""
+
+
+def service_state(unit: str, timeout: int = 20) -> str:
+    """Состояние юнита по `systemctl is-active` (active/failed/inactive/...).
+
+    Не через run_cmd: для остановленного/упавшего юнита is-active выходит
+    с кодом 3, и run_cmd(check=True) превратил бы реальное состояние в "".
+    """
+    try:
+        p = run_process(["systemctl", "is-active", unit], timeout=timeout, check=False)
+    except (CommandError, OSError) as e:
+        logger.warning("service_state failed: %s: %s", unit, e)
+        return "unknown"
+    return (p.stdout or "").strip() or "unknown"
+
+
+def run_argv(cmd: list[str], timeout: int = 60) -> tuple[int, str, str]:
+    """Контракт run_shell (не бросает; таймаут → 124), но списком аргументов,
+    без shell — для команд без пайпов и подстановок. Нет бинарника → 127."""
+    try:
+        p = run_process(cmd, timeout=timeout, retries=0, check=False)
+        return p.returncode, p.stdout.strip(), p.stderr.strip()
+    except CommandError as e:
+        return 124, "", str(e)
+    except OSError as e:
+        return 127, "", f"{cmd[0]}: {e}"
 
 
 def run_shell(command: str, timeout: int = 1800, *, capture_limit: int | None = None) -> tuple[int, str, str]:
@@ -1166,6 +1297,11 @@ def _monitor_key_lock(key: str) -> threading.Lock:
             lock = threading.Lock()
             _MONITOR_KEY_LOCKS[key] = lock
         return lock
+
+
+def cache_invalidate(key: str) -> None:
+    with _MONITOR_CACHE_LOCK:
+        MONITOR_CACHE.pop(key, None)
 
 
 def cached_compute(key: str, ttl_sec: int, producer):
@@ -1295,8 +1431,8 @@ def _network_iface_summary() -> str:
 
 
 def get_server_card_html() -> str:
-    tt_state = run_cmd(["systemctl", "is-active", SERVICE_NAME]) or "unknown"
-    bot_state = run_cmd(["systemctl", "is-active", "tt-bot.service"]) or "unknown"
+    tt_state = service_state(SERVICE_NAME)
+    bot_state = service_state("tt-bot.service")
     ver = get_current_tt_version()
     users_n = len(list_usernames())
     return (
@@ -1323,8 +1459,8 @@ def server_card_inline_kb() -> InlineKeyboardMarkup:
 def get_info_card_html() -> str:
     load1, load5, load15 = os.getloadavg()
     uptime_human = _uptime_pretty()
-    tt_state = run_cmd(["systemctl", "is-active", SERVICE_NAME], timeout=8) or "unknown"
-    bot_state = run_cmd(["systemctl", "is-active", "tt-bot.service"], timeout=8) or "unknown"
+    tt_state = service_state(SERVICE_NAME, timeout=8)
+    bot_state = service_state("tt-bot.service", timeout=8)
     port_line = _port_listening_summary(_tt_tls_port())
     metrics_line = _endpoint_metrics_hint()
 
@@ -1396,8 +1532,8 @@ def _parse_openssl_cert_output(out: str, **extra: Any) -> dict[str, Any]:
 def _cert_info_from_file(cert_path: Path) -> dict[str, Any]:
     if not cert_path.is_file():
         return {"ok": False, "error": f"нет файла: {cert_path}"}
-    code, out, err = run_shell(
-        f"openssl x509 -in {shlex.quote(str(cert_path))} -noout -subject -enddate",
+    code, out, err = run_argv(
+        ["openssl", "x509", "-in", str(cert_path), "-noout", "-subject", "-enddate"],
         timeout=15,
     )
     if code != 0:
@@ -1423,7 +1559,7 @@ def _tt_cert_file_path() -> Path:
     hosts = TT_DIR / "hosts.toml"
     if hosts.is_file():
         try:
-            doc = tomlkit.parse(hosts.read_text(encoding="utf-8"))
+            doc = _parse_toml(hosts.read_text(encoding="utf-8"))
             main_hosts = doc.get("main_hosts")
             if isinstance(main_hosts, list):
                 for item in main_hosts:
@@ -1474,8 +1610,8 @@ def _certbot_timer_lines() -> tuple[str, str]:
     show разбирается по Key=Value, не по позициям строк: пустые свойства
     в выводе -p пропускаются, число строк не совпадает с числом -p.
     """
-    code, out, _err = run_shell(
-        "systemctl show certbot.timer -p LastTriggerUSec -p NextElapseUSecRealtime -p ActiveState",
+    code, out, _err = run_argv(
+        ["systemctl", "show", "certbot.timer", "-p", "LastTriggerUSec", "-p", "NextElapseUSecRealtime", "-p", "ActiveState"],
         timeout=10,
     )
     if code != 0:
@@ -1493,7 +1629,7 @@ def _certbot_timer_lines() -> tuple[str, str]:
     # LEFT-колонку берём из list-timers с зафиксированной локалью C:
     # иначе в ru-локали «6h left» превращается в «осталось 6 ч».
     list_line = run_cmd(
-        ["bash", "-c", "LC_ALL=C systemctl list-timers certbot.timer --no-pager --no-legend"],
+        ["env", "LC_ALL=C", "systemctl", "list-timers", "certbot.timer", "--no-pager", "--no-legend"],
         timeout=10,
     )
     if list_line:
@@ -1630,7 +1766,8 @@ def _aggregate_sessions_from_metrics(
     return cnt, labels
 
 
-def clients_card_html(page: int) -> tuple[str, int, int, bool]:
+def clients_card_html(page: int) -> tuple[str, int]:
+    """(HTML карточки, число страниц)."""
     items = _fetch_metrics_clients()
     if items is None:
         card = (
@@ -1639,12 +1776,12 @@ def clients_card_html(page: int) -> tuple[str, int, int, bool]:
             "Проверь: секция [metrics] с per_client_metrics = true в vpn.toml, "
             "сервис trusttunnel перезапущен.</blockquote>"
         )
-        return card, 1, 0, True
+        return card, 1
 
     cnt, labels = _aggregate_sessions_from_metrics(items)
     if not cnt:
         card = "<b>📈 Клиенты VPN</b>\n<blockquote>Нет подключений.</blockquote>"
-        return card, 1, 0, True
+        return card, 1
 
     ranked = sorted(cnt.items(), key=lambda x: (-x[1], x[0]))
     per = CLIENTS_PER_PAGE
@@ -1659,13 +1796,12 @@ def clients_card_html(page: int) -> tuple[str, int, int, bool]:
 
     online_count = sum(1 for _, n in ranked if n > 0)
     inner = "\n".join(lines)
-    total_sessions = sum(n for _, n in cnt.items())
     card = (
         "<b>📈 Клиенты VPN</b>\n"
         f"<i>🟢 {online_count} онлайн · ⚪ {len(ranked) - online_count} офлайн</i>\n"
         f"<blockquote>{inner}</blockquote>"
     )
-    return card, total_pages, total_sessions, False
+    return card, total_pages
 
 
 def clients_inline_kb(page: int, total_pages: int) -> InlineKeyboardMarkup:
@@ -1685,10 +1821,8 @@ def logs_inline_kb(
     lines: int,
     chunk: int,
     total_chunks: int,
-    *,
-    callback_prefix: str = "logf",
-    footer_parent: str = "info",
 ) -> InlineKeyboardMarkup:
+    callback_prefix = "logf"
     presets = [
         ("ALL", "all"),
         ("ERR", "err"),
@@ -1715,19 +1849,16 @@ def logs_inline_kb(
             nav.append(InlineKeyboardButton("▶️", callback_data=f"{callback_prefix}:{level}:{lines}:{chunk + 1}"))
         rows.append(nav)
     rows.append([InlineKeyboardButton("🔄 Обновить", callback_data=f"{callback_prefix}:{level}:{lines}:{chunk}")])
-    return merge_inline_kb(*rows, card_footer_row(footer_parent))
+    return merge_inline_kb(*rows, card_footer_row("info"))
 
 
 def _fetch_logs_raw(lines: int, *, since: str | None = None) -> tuple[int, str, str]:
     def _produce() -> tuple[int, str, str]:
-        if since:
-            cmd = (
-                f"journalctl -u {SERVICE_NAME} --since '{since}' "
-                "--no-pager -o short-precise"
-            )
-        else:
-            cmd = f"journalctl -u {SERVICE_NAME} -n {lines} --no-pager -o short-precise"
-        return run_shell(cmd, timeout=25)
+        window = ["--since", since] if since else ["-n", str(lines)]
+        return run_argv(
+            ["journalctl", "-u", SERVICE_NAME, *window, "--no-pager", "-o", "short-precise"],
+            timeout=25,
+        )
 
     cache_key = f"logs:{lines}:{since or ''}"
     return cached_compute(cache_key, MONITOR_CACHE_TTL_SEC, _produce)
@@ -1824,7 +1955,11 @@ def list_files_in_latest_backup() -> list[str]:
         return []
 
 
-_PASSWORD_VALUE_RE = re.compile(r'password\s*=\s*(?:"[^"]*"|\'[^\']*\')')
+# Все четыре формы строки TOML: многострочные — первыми (иначе '"' съест
+# открывающие кавычки '"""'), в basic-строке \" и \\ — экранирование, а не конец.
+_PASSWORD_VALUE_RE = re.compile(
+    r'password\s*=\s*(?:"""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"(?:[^"\\\n]|\\.)*"|\'[^\'\n]*\')'
+)
 
 
 def _mask_passwords(text: str) -> str:
@@ -1850,14 +1985,16 @@ def _diff_against_latest_backup() -> str:
                     member = tar.extractfile(name)
                 except KeyError:
                     member = None
-                backed_up[name] = member.read().decode("utf-8") if member else ""
+                backed_up[name] = member.read().decode("utf-8", "replace") if member else ""
     except (tarfile.TarError, OSError) as e:
         return f"Не удалось прочитать бэкап: {e}"
 
     diffs = []
     for name in BACKUP_FILES:
         live_path = TT_DIR / name
-        live_text = live_path.read_text(encoding="utf-8") if live_path.exists() else ""
+        # errors="replace": битые байты не должны ронять /diff молча — показываем
+        # их как «�», это и есть полезный сигнал о порче файла.
+        live_text = live_path.read_text(encoding="utf-8", errors="replace") if live_path.exists() else ""
         backup_text = backed_up.get(name, "")
         if live_text == backup_text:
             continue
@@ -1906,6 +2043,7 @@ def restore_file_from_latest_backup(filename: str, *, restart_service: bool = Tr
         return False, f"Не удалось открыть бэкап: {e}"
 
     target = TT_DIR / filename
+    snapshot = _snapshot_tt_files([target])
     restore_backup_dir = TT_DIR / "backup" / "restore-prev"
     restore_backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = _backup_timestamp()
@@ -1913,7 +2051,7 @@ def restore_file_from_latest_backup(filename: str, *, restart_service: bool = Tr
     try:
         old_mode = target.stat().st_mode & 0o777 if target.exists() else None
         if target.exists():
-            prev = restore_backup_dir / f"{filename}.{stamp}"
+            prev = _unique_backup_path(restore_backup_dir, f"{filename}.{stamp}")
             _atomic_write_bytes(prev, target.read_bytes(), mode=old_mode)
             _prune_backup_dir(restore_backup_dir, f"{filename}.*", BACKUP_KEEP_RESTORE_PREV)
         with NamedTemporaryFile("wb", dir=str(TT_DIR), delete=False) as tmp:
@@ -1935,6 +2073,10 @@ def restore_file_from_latest_backup(filename: str, *, restart_service: bool = Tr
             apply_tt_config_change()
         return True, "ok"
     except Exception as e:
+        # Как в restore_multiple: при ❌ на диске должно остаться прежнее.
+        _restore_tt_files(snapshot)
+        if restart_service:
+            _ensure_tt_running_best_effort()
         return False, f"Ошибка восстановления: {e}"
 
 
@@ -1953,12 +2095,25 @@ def restore_multiple_from_latest_backup(filenames: list[str]) -> tuple[bool, str
         apply_tt_config_change()
     except Exception:
         _restore_tt_files(snapshot)
+        _ensure_tt_running_best_effort()
         return False, "Не удалось применить восстановленные файлы — откат выполнен."
     return True, ", ".join(restored)
 
 
 def _backup_timestamp() -> str:
     return dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+
+
+def _unique_backup_path(dir_path: Path, name: str, suffix: str = "") -> Path:
+    """`<name><suffix>`, а если такой уже есть (штамп с точностью до секунды,
+    несколько записей подряд) — `<name>-1<suffix>`, `-2`…, чтобы бэкап
+    исходного состояния не затирался промежуточным."""
+    path = dir_path / f"{name}{suffix}"
+    n = 1
+    while path.exists():
+        path = dir_path / f"{name}-{n}{suffix}"
+        n += 1
+    return path
 
 
 def _stamped_backup(
@@ -1981,8 +2136,7 @@ def _stamped_backup(
     dir_path.mkdir(parents=True, exist_ok=True)
     if dir_mode is not None:
         dir_path.chmod(dir_mode)
-    stamp = _backup_timestamp()
-    path = dir_path / f"{stem}-{stamp}{suffix}"
+    path = _unique_backup_path(dir_path, f"{stem}-{_backup_timestamp()}", suffix)
     _atomic_write_bytes(path, data.encode("utf-8"), mode=file_mode)
     _prune_backup_dir(dir_path, f"{stem}-*{suffix}", keep)
     return path
@@ -2002,7 +2156,7 @@ def _load_credentials_doc() -> tuple[Any, str]:
     if not CRED_FILE.exists():
         raise RuntimeError("credentials.toml не найден")
     raw = CRED_FILE.read_text(encoding="utf-8")
-    return tomlkit.parse(raw), raw
+    return _parse_toml(raw), raw
 
 
 def _clients_aot(doc: Any) -> Any:
@@ -2065,6 +2219,12 @@ def _atomic_write_file(path: Path, text: str) -> None:
     _atomic_write_bytes(path, text.encode("utf-8"), mode=old_mode)
 
 
+class PrefixMapError(ValueError):
+    """user_prefix_map.toml не читается. Не подменяем его пустой картой:
+    авточистка сочла бы сиротами все allow-правила и стёрла их, а следующая
+    запись карты затёрла бы остальные записи."""
+
+
 def _load_prefix_map() -> dict[str, str]:
     if not PREFIX_MAP_FILE.exists():
         return {}
@@ -2072,9 +2232,9 @@ def _load_prefix_map() -> dict[str, str]:
     if not raw.strip():
         return {}
     try:
-        doc = tomlkit.parse(raw)
-    except ValueError:
-        return {}
+        doc = _parse_toml(raw)
+    except ValueError as e:
+        raise PrefixMapError(f"{PREFIX_MAP_FILE.name} повреждён, исправь вручную: {e}") from e
     tbl = doc.get("user_prefix")
     if tbl is None:
         return {}
@@ -2099,13 +2259,22 @@ def _save_prefix_map(mapping: dict[str, str]) -> None:
     _atomic_write_file(PREFIX_MAP_FILE, text)
 
 
-def _load_user_profiles() -> dict[str, dict[str, Any]]:
+def _load_user_profiles(*, set_aside_corrupt: bool = False) -> dict[str, dict[str, Any]]:
+    """set_aside_corrupt=True — для записи: битый файл сначала копируется в
+    user_profiles.json.corrupt-<штамп>, иначе следующая запись затёрла бы
+    профили всех пользователей без следа."""
     if not USER_PROFILES_FILE.exists():
         return {}
     try:
         raw = USER_PROFILES_FILE.read_text(encoding="utf-8")
         data = json.loads(raw) if raw.strip() else {}
-    except (OSError, ValueError):
+    except (OSError, ValueError) as e:
+        if set_aside_corrupt and isinstance(e, ValueError):
+            aside = _unique_backup_path(
+                USER_PROFILES_FILE.parent, f"{USER_PROFILES_FILE.name}.corrupt-{_backup_timestamp()}"
+            )
+            _atomic_write_bytes(aside, USER_PROFILES_FILE.read_bytes(), mode=0o600)
+            logger.warning("%s повреждён, копия: %s", USER_PROFILES_FILE.name, aside)
         return {}
     if not isinstance(data, dict):
         return {}
@@ -2127,7 +2296,7 @@ def _get_user_profile(username: str) -> dict[str, Any]:
 
 
 def _set_user_profile(username: str, *, protocol: str, random_prefix: bool) -> None:
-    profiles = _load_user_profiles()
+    profiles = _load_user_profiles(set_aside_corrupt=True)
     profiles[username] = {
         "protocol": protocol if protocol in ("h2", "quic") else "h2",
         "random_prefix": bool(random_prefix),
@@ -2137,7 +2306,7 @@ def _set_user_profile(username: str, *, protocol: str, random_prefix: bool) -> N
 
 
 def _delete_user_profile(username: str) -> None:
-    profiles = _load_user_profiles()
+    profiles = _load_user_profiles(set_aside_corrupt=True)
     if username in profiles:
         profiles.pop(username, None)
         _save_user_profiles(profiles)
@@ -2150,7 +2319,7 @@ def _extract_allow_prefixes() -> list[str]:
     if not raw.strip():
         return []
     try:
-        doc = tomlkit.parse(raw)
+        doc = _parse_toml(raw)
     except ValueError:
         return []
     rules = doc.get("rule")
@@ -2199,16 +2368,25 @@ def _next_rule_block(lines: list[str], start: int) -> tuple[int, int, int] | Non
     else:
         return None
 
+    # Блок тянется до следующего заголовка таблицы ([[rule]], [x]) или тега
+    # следующего блока. Комментарии МЕЖДУ ключами — часть блока (иначе при
+    # удалении хвост блока прилипает к соседу), а хвостовые комментарии
+    # после последнего ключа — уже не его и сохраняются.
     j = rule_start + 1
+    last_kv = rule_start
     while j < n:
         stripped = lines[j].strip()
-        if stripped == "[[rule]]":
+        if stripped.startswith("["):
             break
-        if stripped.startswith("#"):
-            # Комментарий начинает следующий блок.
+        if _is_user_rule_tag_line(lines[j]) and j + 1 < n and lines[j + 1].strip() == "[[rule]]":
             break
+        if stripped and not stripped.startswith("#"):
+            last_kv = j
         j += 1
-    return block_start, rule_start, j
+    end = last_kv + 1
+    while end < j and not lines[end].strip():
+        end += 1
+    return block_start, rule_start, end
 
 
 def _read_rules_raw() -> str | None:
@@ -2223,13 +2401,14 @@ def _parse_rule_block_fields(rule_lines: list[str]) -> tuple[str, str]:
     """(action, client_random_prefix) блока, в нижнем регистре."""
     action = ""
     prefix = ""
+    # Обе формы строки TOML: tomlkit (_extract_allow_prefixes) видит и '…'.
     for ln in rule_lines:
-        m_act = re.match(r'\s*action\s*=\s*"([^"]+)"', ln, re.IGNORECASE)
+        m_act = re.match(r'\s*action\s*=\s*(?:"([^"]+)"|\'([^\']+)\')', ln, re.IGNORECASE)
         if m_act:
-            action = m_act.group(1).strip().lower()
-        m_pref = re.match(r'\s*client_random_prefix\s*=\s*"([^"]+)"', ln, re.IGNORECASE)
+            action = (m_act.group(1) or m_act.group(2)).strip().lower()
+        m_pref = re.match(r'\s*client_random_prefix\s*=\s*(?:"([^"]+)"|\'([^\']+)\')', ln, re.IGNORECASE)
         if m_pref:
-            prefix = m_pref.group(1).strip().lower()
+            prefix = (m_pref.group(1) or m_pref.group(2)).strip().lower()
     return action, prefix
 
 
@@ -2285,7 +2464,8 @@ def _remove_prefix_rules_for_user(prefixes: list[str], username: str) -> int:
         return 0
     needles = {p.strip().lower() for p in prefixes if p and p.strip()}
     user = username.strip()
-    user_tag_re = re.compile(rf'^\s*#\s*user\s*:\s*{re.escape(user)}\s*$', re.IGNORECASE) if user else None
+    # Регистронезависимо только слово «user»: имена bob и Bob — разные пользователи.
+    user_tag_re = re.compile(rf'^\s*#\s*(?i:user)\s*:\s*{re.escape(user)}\s*$') if user else None
 
     lines = raw.splitlines(keepends=True)
     out: list[str] = []
@@ -2530,6 +2710,13 @@ def _user_list_button_label(username: str, active_users: set[str]) -> str:
     return f"{state} {username}"
 
 
+def _users_page_slice(users: list[str], page: int, total_pages: int) -> tuple[int, list[str]]:
+    """(страница, приведённая к диапазону; пользователи этой страницы)."""
+    page = max(0, min(page, total_pages - 1))
+    per = USERS_PER_PAGE
+    return page, users[page * per : (page + 1) * per]
+
+
 def build_users_list_html(page: int = 0, *, filter_mode: str | None = "all") -> tuple[str, int, list[str]]:
     all_users = sorted(list_usernames())
     mode = _normalize_users_filter(filter_mode)
@@ -2555,6 +2742,10 @@ def build_users_list_html(page: int = 0, *, filter_mode: str | None = "all") -> 
     return "\n\n".join(lines), total_pages, users
 
 
+def _username_fits_buttons(username: str) -> bool:
+    return len(username.encode("utf-8")) <= MAX_USERNAME_LEN
+
+
 def users_list_inline_kb(
     page: int,
     total_pages: int,
@@ -2575,7 +2766,7 @@ def users_list_inline_kb(
     user_buttons = [
         InlineKeyboardButton(_user_list_button_label(username, active_users), callback_data=f"udev:{username}")
         for username in users_on_page
-        if len(username) <= MAX_USERNAME_LEN
+        if _username_fits_buttons(username)
     ]
     for i in range(0, len(user_buttons), 2):
         rows.append(user_buttons[i : i + 2])
@@ -2597,7 +2788,7 @@ def _users_filter_from_context(context: ContextTypes.DEFAULT_TYPE | None) -> str
 
 
 def user_detail_inline_kb(username: str) -> InlineKeyboardMarkup:
-    if len(username) > MAX_USERNAME_LEN:
+    if not _username_fits_buttons(username):
         return merge_inline_kb(
             card_footer_row("user"),
         )
@@ -2619,7 +2810,7 @@ def user_detail_inline_kb(username: str) -> InlineKeyboardMarkup:
 
 
 def toml_share_kb(username: str) -> InlineKeyboardMarkup:
-    if len(username) > MAX_USERNAME_LEN:
+    if not _username_fits_buttons(username):
         return InlineKeyboardMarkup([])
     return InlineKeyboardMarkup(
         [
@@ -2636,17 +2827,20 @@ def toml_share_kb(username: str) -> InlineKeyboardMarkup:
 
 
 def validate_tt_configs() -> tuple[bool, str]:
-    """Проверяет TOML-синтаксис vpn.toml/hosts.toml перед restart/reload.
+    """Проверяет TOML-синтаксис конфигов перед restart/reload: vpn.toml и
+    hosts.toml обязательны, credentials.toml и rules.toml — если есть.
 
     Раньше звала `trusttunnel_endpoint vpn.toml hosts.toml -v` — но -v это
     --version у самого эндпоинта: печатает версию и выходит, не читая
     settings-файлы вообще (проверено по исходнику main.rs). Проверка была
     no-op и всегда возвращала успех независимо от содержимого файлов.
     """
-    for name in ("vpn.toml", "hosts.toml"):
+    for name in ("vpn.toml", "hosts.toml", "credentials.toml", "rules.toml"):
         path = TT_DIR / name
+        if name in ("credentials.toml", "rules.toml") and not path.exists():
+            continue
         try:
-            tomlkit.parse(path.read_text(encoding="utf-8"))
+            _parse_toml(path.read_text(encoding="utf-8"))
         except OSError as e:
             return False, f"{name}: {e}"
         except ValueError as e:
@@ -2655,10 +2849,7 @@ def validate_tt_configs() -> tuple[bool, str]:
 
 
 def service_reload_tls_if_possible() -> bool:
-    code, out, _ = run_shell(
-        f"systemctl show {SERVICE_NAME} -p CanReload --value",
-        timeout=10,
-    )
+    code, out, _ = run_argv(["systemctl", "show", SERVICE_NAME, "-p", "CanReload", "--value"], timeout=10)
     if code != 0 or out.strip().lower() != "yes":
         return False
     run_process(["systemctl", "reload", SERVICE_NAME], timeout=40, retries=1, check=True)
@@ -2709,8 +2900,12 @@ _DEEPLINK_TAG_HAS_IPV6 = 0x04
 
 def _deeplink_read_varint(data: bytes, offset: int) -> tuple[int, int]:
     """QUIC varint (RFC 9000 §16): 2 старших бита 1-го байта — длина 1/2/4/8."""
+    if offset >= len(data):
+        raise ValueError("TLV повреждён: varint за концом данных")
     first = data[offset]
     length = 1 << (first >> 6)
+    if offset + length > len(data):
+        raise ValueError("TLV повреждён: обрезанный varint")
     value = first & 0x3F
     for b in data[offset + 1 : offset + length]:
         value = (value << 8) | b
@@ -2727,54 +2922,40 @@ def _deeplink_write_varint(value: int) -> bytes:
     return (0xC000000000000000 | value).to_bytes(8, "big")
 
 
+_DEEPLINK_PREFIX = "tt://?"
+
+
 def _deeplink_force_has_ipv6_off(deeplink: str) -> str:
     """Сервер не проксирует IPv6; апстрим хардкодит has_ipv6=true в deeplink
     (TLV tag 0x04, DEEP_LINK.md), в отличие от .toml — правим TLV руками.
     Ошибка разбора — возвращаем вход как есть."""
-    prefix = "tt://?"
-    if not deeplink.startswith(prefix):
-        return deeplink
-    payload = deeplink[len(prefix):]
-    padded = payload + "=" * (-len(payload) % 4)
     try:
-        data = base64.urlsafe_b64decode(padded)
+        items = _deeplink_tlv_items(deeplink)
     except ValueError:
         return deeplink
-
     out = bytearray()
-    try:
-        offset = 0
-        while offset < len(data):
-            tag, offset = _deeplink_read_varint(data, offset)
-            length, offset = _deeplink_read_varint(data, offset)
-            value = data[offset : offset + length]
-            if len(value) != length:
-                return deeplink
-            offset += length
-            if tag == _DEEPLINK_TAG_HAS_IPV6:
-                continue
-            out += _deeplink_write_varint(tag)
-            out += _deeplink_write_varint(length)
-            out += value
-    except IndexError:
-        return deeplink
-
+    for tag, value in items:
+        if tag == _DEEPLINK_TAG_HAS_IPV6:
+            continue
+        out += _deeplink_write_varint(tag)
+        out += _deeplink_write_varint(len(value))
+        out += value
     out += _deeplink_write_varint(_DEEPLINK_TAG_HAS_IPV6)
     out += _deeplink_write_varint(1)
     out += b"\x00"
 
     encoded = base64.urlsafe_b64encode(bytes(out)).rstrip(b"=").decode("ascii")
-    return f"{prefix}{encoded}"
+    return f"{_DEEPLINK_PREFIX}{encoded}"
 
 
-def _decode_deeplink_tags(deeplink: str) -> dict[int, bytes]:
-    prefix = "tt://?"
-    if not deeplink.startswith(prefix):
+def _deeplink_tlv_items(deeplink: str) -> list[tuple[int, bytes]]:
+    """(tag, value) по порядку; любая порча (не tt://?, base64, обрезанный
+    varint или значение) — ValueError."""
+    if not deeplink.startswith(_DEEPLINK_PREFIX):
         raise ValueError("не deeplink URI (нет tt://?)")
-    payload = deeplink[len(prefix):]
-    padded = payload + "=" * (-len(payload) % 4)
-    data = base64.urlsafe_b64decode(padded)
-    tags: dict[int, bytes] = {}
+    payload = deeplink[len(_DEEPLINK_PREFIX):]
+    data = base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4))
+    items: list[tuple[int, bytes]] = []
     offset = 0
     while offset < len(data):
         tag, offset = _deeplink_read_varint(data, offset)
@@ -2783,8 +2964,12 @@ def _decode_deeplink_tags(deeplink: str) -> dict[int, bytes]:
         if len(value) != length:
             raise ValueError("TLV повреждён: длина не совпадает")
         offset += length
-        tags[tag] = value
-    return tags
+        items.append((tag, value))
+    return items
+
+
+def _decode_deeplink_tags(deeplink: str) -> dict[int, bytes]:
+    return dict(_deeplink_tlv_items(deeplink))
 
 
 _DEEPLINK_REQUIRED_TAGS = {0x01: "hostname", 0x02: "addresses", 0x05: "username", 0x06: "password"}
@@ -2804,7 +2989,7 @@ def _validate_deeplink(deeplink: str) -> None:
 def _validate_client_toml(text: str) -> None:
     """Гейт перед выдачей .toml пользователю: обязательные поля на месте,
     has_ipv6 не откатился на дефолт апстрима."""
-    doc = tomlkit.parse(text)
+    doc = _parse_toml(text)
     endpoint = doc.get("endpoint")
     if not isinstance(endpoint, dict):
         raise ValueError("TOML без секции [endpoint]")
@@ -2815,12 +3000,15 @@ def _validate_client_toml(text: str) -> None:
         raise ValueError("TOML с has_ipv6 != false")
 
 
-def generate_deeplink(
+def _endpoint_export_cmd(
     username: str,
+    fmt: str,
     *,
-    generate_new_prefix: bool = False,
-    client_random_prefix: str | None = None,
-) -> str:
+    dns_upstreams: list[str],
+    generate_new_prefix: bool,
+    client_random_prefix: str | None,
+) -> list[str]:
+    """Команда выдачи клиентского конфига (fmt: deeplink | toml)."""
     cmd = [
         "./trusttunnel_endpoint",
         "vpn.toml",
@@ -2830,17 +3018,32 @@ def generate_deeplink(
         "-a",
         _client_endpoint_address(ADDRESS),
         "--format",
-        "deeplink",
+        fmt,
         "--name",
         SERVER_NAME,
     ]
-    upstreams = _protocol_dns_values()
-    for dns in upstreams:
+    for dns in dns_upstreams:
         cmd.extend(["--dns-upstream", dns])
     if client_random_prefix:
         cmd.extend(["--client-random-prefix", client_random_prefix])
     elif generate_new_prefix:
         cmd.append("--generate-client-random-prefix")
+    return cmd
+
+
+def generate_deeplink(
+    username: str,
+    *,
+    generate_new_prefix: bool = False,
+    client_random_prefix: str | None = None,
+) -> str:
+    cmd = _endpoint_export_cmd(
+        username,
+        "deeplink",
+        dns_upstreams=_protocol_dns_values(),
+        generate_new_prefix=generate_new_prefix,
+        client_random_prefix=client_random_prefix,
+    )
 
     p = run_process(
         cmd,
@@ -2892,7 +3095,7 @@ def _force_ipv6_off_toml(text: str) -> str:
     if not text.strip():
         return text
     try:
-        doc = tomlkit.parse(text)
+        doc = _parse_toml(text)
     except ValueError:
         return text
     # has_ipv6 может быть топ-уровнем или внутри [endpoint].
@@ -2964,9 +3167,11 @@ def _build_client_style_toml(
     dns_upstreams: list[str],
 ) -> str:
     try:
-        src = tomlkit.parse(base_text)
-    except ValueError:
-        return base_text
+        src = _parse_toml(base_text)
+    except ValueError as e:
+        # Отдать как есть нельзя: мимо _validate_client_toml ушёл бы конфиг
+        # без гарантии has_ipv6=false. Хендлеры покажут «не удалось».
+        raise ValueError(f"trusttunnel_endpoint вернул некорректный TOML: {e}") from e
 
     endpoint_src = src.get("endpoint")
     endpoint_tbl = endpoint_src if isinstance(endpoint_src, dict) else src
@@ -3002,26 +3207,13 @@ def generate_toml_config(
     client_random_prefix: str | None = None,
     dns_upstreams: list[str] | None = None,
 ) -> str:
-    cmd = [
-        "./trusttunnel_endpoint",
-        "vpn.toml",
-        "hosts.toml",
-        "-c",
+    cmd = _endpoint_export_cmd(
         username,
-        "-a",
-        _client_endpoint_address(ADDRESS),
-        "--format",
         "toml",
-        "--name",
-        SERVER_NAME,
-    ]
-    upstreams = dns_upstreams or []
-    for dns in upstreams:
-        cmd.extend(["--dns-upstream", dns])
-    if client_random_prefix:
-        cmd.extend(["--client-random-prefix", client_random_prefix])
-    elif generate_new_prefix:
-        cmd.append("--generate-client-random-prefix")
+        dns_upstreams=dns_upstreams or [],
+        generate_new_prefix=generate_new_prefix,
+        client_random_prefix=client_random_prefix,
+    )
 
     p = run_process(cmd, cwd=TT_DIR, timeout=60, retries=1, check=True)
     text = (p.stdout or "").strip()
@@ -3038,7 +3230,7 @@ def add_user_and_make_link(
 ) -> str:
     if not USERNAME_RE.fullmatch(username):
         raise ValueError("Некорректный username")
-    if len(username) > MAX_USERNAME_LEN:
+    if not _username_fits_buttons(username):
         raise ValueError(f"Слишком длинный username (макс. {MAX_USERNAME_LEN} символов)")
     if not password:
         raise ValueError("Пустой password")
@@ -3050,6 +3242,8 @@ def add_user_and_make_link(
     existing = {str(c.get("username", "")).strip() for c in clients_aot}
     if username in existing:
         raise ValueError("Пользователь уже существует")
+    # Битая карта префиксов — отказ до первой записи (PrefixMapError).
+    _load_prefix_map()
 
     new_client = tomlkit.table()
     new_client["username"] = username
@@ -3057,12 +3251,10 @@ def add_user_and_make_link(
     clients_aot.append(new_client)
     _atomic_write_credentials(tomlkit.dumps(doc), old_text)
 
-    # Если apply_tt_config_change упадёт ниже, после того как prefix-мап/
-    # rules.toml уже обновлены — откатить и их, иначе останется привязка
-    # к несуществующему пользователю.
-    made_prefix_map_change = False
-    made_rule_change = False
-    rollback_prefix: str | None = None
+    # Снимок rules/карты — до генерации: правило может дописать сам бинарник
+    # (generate_new_prefix), и любой сбой после этого должен его убрать,
+    # иначе останется привязка к несуществующему пользователю.
+    snapshot = _snapshot_tt_files([RULES_FILE, PREFIX_MAP_FILE])
     try:
         before_prefixes = set(_extract_allow_prefixes()) if random_prefix else set()
         deeplink = generate_deeplink(username, generate_new_prefix=random_prefix)
@@ -3079,13 +3271,11 @@ def add_user_and_make_link(
                         username,
                         ",".join(new_prefixes),
                     )
-                rollback_prefix = new_prefixes[0]
+                new_prefix = new_prefixes[0]
                 mapping = _load_prefix_map()
-                mapping[username] = rollback_prefix
+                mapping[username] = new_prefix
                 _save_prefix_map(mapping)
-                made_prefix_map_change = True
-                _tag_prefix_rule_with_username(rollback_prefix, username)
-                made_rule_change = True
+                _tag_prefix_rule_with_username(new_prefix, username)
         else:
             mapping = _load_prefix_map()
             if username in mapping:
@@ -3097,12 +3287,8 @@ def add_user_and_make_link(
         return deeplink
     except Exception:
         _atomic_write_credentials(old_text, old_text)
-        if made_rule_change and rollback_prefix:
-            _remove_prefix_rules_for_user([rollback_prefix], username)
-        if made_prefix_map_change:
-            mapping = _load_prefix_map()
-            mapping.pop(username, None)
-            _save_prefix_map(mapping)
+        _restore_tt_files(snapshot)
+        _ensure_tt_running_best_effort()
         raise
 
 
@@ -3206,16 +3392,19 @@ def build_add_conversation() -> ConversationHandler:
     # отдельных сообщениях — не на стартовом. Без этого inline-кнопки не сработают.
     # addcancel зарегистрирован в каждом состоянии: исходная кнопка "Отмена"
     # остаётся видна на экране весь диалог, а не только на первом шаге.
+    # Порядок обёрток как в маршрутах: allow_guard снаружи busy_guard —
+    # чужому «Нет доступа», а не «Жди: …». Отмена без busy_guard: она ничего
+    # не меняет на сервере и должна работать во время фоновой операции.
     def _addcancel_handler() -> CallbackQueryHandler:
         return CallbackQueryHandler(
-            traced_callback("add_cancel_callback", busy_guard(allow_guard(add_cancel_callback, conv_end=True))),
+            traced_callback("add_cancel_callback", allow_guard(add_cancel_callback, conv_end=True)),
             pattern=r"^addcancel$",
         )
 
     return ConversationHandler(
         entry_points=[
             CallbackQueryHandler(
-                traced_callback("add_entry_cb", busy_guard(allow_guard(add_entry_cb, conv_end=True))),
+                traced_callback("add_entry_cb", allow_guard(busy_guard(add_entry_cb), conv_end=True)),
                 pattern=r"^vpn:add$",
             ),
         ],
@@ -3231,14 +3420,14 @@ def build_add_conversation() -> ConversationHandler:
             ASK_ADD_PREFIX: [
                 _addcancel_handler(),
                 CallbackQueryHandler(
-                    traced_callback("add_prefix_choice", busy_guard(allow_guard(add_prefix_choice, conv_end=True))),
+                    traced_callback("add_prefix_choice", allow_guard(busy_guard(add_prefix_choice), conv_end=True)),
                     pattern=r"^addpref:",
                 ),
             ],
             ASK_ADD_PROTOCOL: [
                 _addcancel_handler(),
                 CallbackQueryHandler(
-                    traced_callback("add_protocol_choice", busy_guard(allow_guard(add_protocol_choice, conv_end=True))),
+                    traced_callback("add_protocol_choice", allow_guard(busy_guard(add_protocol_choice), conv_end=True)),
                     pattern=r"^addproto:",
                 ),
             ],
@@ -3273,7 +3462,7 @@ def _endpoint_metrics_hint() -> str:
         return "🟡 метрики: vpn.toml не найден"
     addr = ""
     try:
-        doc = tomlkit.parse(vpn_path.read_text(encoding="utf-8"))
+        doc = _parse_toml(vpn_path.read_text(encoding="utf-8"))
         metrics = doc.get("metrics")
         if not metrics:
             return "🟡 метрики: выключены в vpn.toml"
@@ -3293,7 +3482,7 @@ def _endpoint_metrics_hint() -> str:
 
 
 def _port_listening_summary(port: int) -> str:
-    out = run_cmd(["bash", "-c", f"ss -ltn 'sport = :{port}'"], timeout=8) or ""
+    out = run_cmd(["ss", "-ltn", f"sport = :{port}"], timeout=8) or ""
     listening = any(line.strip().startswith("LISTEN") for line in out.splitlines())
     return f"{'🟢' if listening else '🔴'} порт {port}: {'слушает' if listening else 'НЕ слушает'}"
 
@@ -3393,7 +3582,7 @@ def _classify_user_pick(users: list[str]) -> tuple[str, list[str], bool]:
     """Статус списка для picker: 'empty' | 'too_long' | 'ok'."""
     if not users:
         return "empty", [], False
-    safe = [u for u in users if len(u) <= MAX_USERNAME_LEN]
+    safe = [u for u in users if _username_fits_buttons(u)]
     if not safe:
         return "too_long", [], False
     return "ok", safe, len(safe) < len(users)
@@ -3476,8 +3665,8 @@ async def run_rotate_pick(bot, cid: int, context: ContextTypes.DEFAULT_TYPE) -> 
         cb_prefix="rotpick",
         empty_hint="сначала добавь пользователя в разделе VPN",
         too_long_title="Имена слишком длинные для inline-кнопок.",
-        too_long_hint=f"сократи username (макс. {MAX_USERNAME_LEN} символов) в credentials.toml",
-        hidden_hint=f"Не все клиенты в списке (имя &gt; {MAX_USERNAME_LEN} симв.) — правь файл вручную.",
+        too_long_hint=f"сократи username (макс. {MAX_USERNAME_LEN} байт, кириллица — 2 байта на букву) в credentials.toml",
+        hidden_hint=f"Не все клиенты в списке (имя &gt; {MAX_USERNAME_LEN} байт) — правь файл вручную.",
     )
 
 
@@ -3490,8 +3679,8 @@ async def run_export_pick(bot, cid: int, *, context: ContextTypes.DEFAULT_TYPE |
         cb_prefix="exppick",
         empty_hint="сначала добавь пользователя в разделе VPN",
         too_long_title="Кнопки экспорта недоступны: имена слишком длинные.",
-        too_long_hint=f"сократи username (макс. {MAX_USERNAME_LEN} символов)",
-        hidden_hint=f"Часть клиентов скрыта (имя &gt; {MAX_USERNAME_LEN} симв.).",
+        too_long_hint=f"сократи username (макс. {MAX_USERNAME_LEN} байт, кириллица — 2 байта на букву)",
+        hidden_hint=f"Часть клиентов скрыта (имя &gt; {MAX_USERNAME_LEN} байт).",
     )
 
 
@@ -3506,8 +3695,8 @@ async def run_user_delete_list(bot, cid: int, *, context: ContextTypes.DEFAULT_T
         button_style="danger",
         empty_hint="добавь пользователя перед удалением",
         too_long_title="Удаление через кнопки недоступно.",
-        too_long_hint=f"сократи username (макс. {MAX_USERNAME_LEN} символов)",
-        hidden_hint=f"Скрыты клиенты с именем &gt; {MAX_USERNAME_LEN} симв. — удали вручную в файле.",
+        too_long_hint=f"сократи username (макс. {MAX_USERNAME_LEN} байт, кириллица — 2 байта на букву)",
+        hidden_hint=f"Скрыты клиенты с именем &gt; {MAX_USERNAME_LEN} байт — удали вручную в файле.",
     )
 
 
@@ -3529,6 +3718,7 @@ def _apply_rotate_password_sync(
         apply_tt_config_change()
     except Exception:
         _atomic_write_credentials(old_text, old_text)
+        _ensure_tt_running_best_effort()
         raise
     prefix, _ = _export_context_for_username(username)
     deeplink = generate_deeplink(username, client_random_prefix=prefix)
@@ -3568,29 +3758,38 @@ def _add_user_bundle_sync(username: str, password: str, random_prefix: bool) -> 
     return deeplink, deeplink_qr_png(deeplink)
 
 
-def _snapshot_tt_files(paths: list[Path]) -> dict[Path, tuple[str, int] | None]:
-    return {
-        p: (p.read_text(encoding="utf-8"), p.stat().st_mode & 0o777) if p.exists() else None
-        for p in paths
-    }
+def _snapshot_tt_files(paths: list[Path]) -> dict[Path, tuple[bytes | None, int | None]]:
+    """Байты, а не текст: файл с не-UTF-8 содержимым не должен ронять снимок
+    (а с ним и откат). (None, None) — файла не было, откат его удалит."""
+    return {p: _read_file_snapshot(p) for p in paths}
 
 
-def _restore_tt_files(snapshot: dict[Path, tuple[str, int] | None]) -> None:
-    for p, saved in snapshot.items():
-        if saved is None:
+def _restore_tt_files(snapshot: dict[Path, tuple[bytes | None, int | None]]) -> None:
+    for p, (data, mode) in snapshot.items():
+        if data is None:
             p.unlink(missing_ok=True)
         else:
-            text, mode = saved
-            _atomic_write_bytes(p, text.encode("utf-8"), mode=mode)
+            _atomic_write_bytes(p, data, mode=mode)
 
 
 def _delete_user_and_restart_sync(username: str) -> tuple[bool, int]:
     """Удаляет пользователя; возвращает (ok, число снятых allow-правил).
 
-    Если apply_tt_config_change упадёт после того как все 4 хранилища
-    (credentials/profiles/prefix-map/rules) уже изменены — откатываем все.
+    Любой сбой после первой записи (в том числе apply_tt_config_change)
+    откатывает все 4 хранилища (credentials/profiles/prefix-map/rules).
     """
+    # Битая карта префиксов — отказ до первой записи (PrefixMapError).
+    _load_prefix_map()
     snapshot = _snapshot_tt_files([CRED_FILE, USER_PROFILES_FILE, PREFIX_MAP_FILE, RULES_FILE])
+    try:
+        return _delete_user_and_restart_body(username)
+    except Exception:
+        _restore_tt_files(snapshot)
+        _ensure_tt_running_best_effort()
+        raise
+
+
+def _delete_user_and_restart_body(username: str) -> tuple[bool, int]:
     if not delete_user(username):
         return False, 0
     had_prefix_profile = bool(_get_user_profile(username).get("random_prefix"))
@@ -3614,11 +3813,7 @@ def _delete_user_and_restart_sync(username: str) -> tuple[bool, int]:
         )
     auto_removed_rules, _ = _auto_cleanup_rules_orphans()
     rules_removed += len(auto_removed_rules)
-    try:
-        apply_tt_config_change()
-    except Exception:
-        _restore_tt_files(snapshot)
-        raise
+    apply_tt_config_change()
     return True, rules_removed
 
 
@@ -3632,13 +3827,14 @@ def _tt_install_sync(version: str) -> tuple[int, str, str]:
     # на карточке tег v1.2.3 — и получает именно его, а не HEAD ветки.
     ver = version.strip().lstrip("vV")
     tag = shlex.quote(version.strip())
+    url = f"https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/tags/{tag}/scripts/install.sh"
     return run_shell(
-        # pipefail: без него код возврата пайпа — это код sh (последнего в
-        # цепочке), а не curl. При сбое curl (сеть/DNS/rate-limit/битый тег)
-        # sh получает пустой stdin и молча выходит с 0 — апгрейд считался бы
-        # успешным, хотя ничего не установилось.
-        f"set -o pipefail; curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/tags/{tag}/scripts/install.sh "
-        f"| sh -s -- -a y -V {shlex.quote(ver)}",
+        # Сначала скачать целиком, потом запускать: `curl | sh` исполняет
+        # скрипт по мере поступления и при обрыве загрузки успевает выполнить
+        # его начало. Запуск — только если curl вернул 0; код выхода — код
+        # curl или установщика, а не молчаливый 0 от пустого sh.
+        'f="$(mktemp)" || exit 1; trap \'rm -f "$f"\' EXIT; '
+        f'curl -fsSL {url} -o "$f" && sh "$f" -a y -V {shlex.quote(ver)}',
         timeout=1800,
         capture_limit=24000,
     )
@@ -3678,6 +3874,17 @@ def _tt_start_best_effort() -> None:
     """Best-effort попытка поднять сервис после сбоя апгрейда — не бросает
     исключение, если не получилось (ошибка уже сообщена отдельно)."""
     run_process(["systemctl", "start", SERVICE_NAME], timeout=40, retries=0, check=False)
+
+
+def _ensure_tt_running_best_effort() -> None:
+    """После отката конфигов: поднять сервис, если упавший restart его
+    уронил. Active не трогаем — сбой валидации до рестарта не должен рвать
+    живые сессии. Не бросает: исходная ошибка важнее и уже летит выше."""
+    try:
+        if service_state(SERVICE_NAME) != "active":
+            _tt_start_best_effort()
+    except Exception:
+        logger.exception("Не удалось поднять %s после отката", SERVICE_NAME)
 
 
 async def run_backup(bot, cid: int, *, context: ContextTypes.DEFAULT_TYPE | None = None) -> None:
@@ -3822,6 +4029,18 @@ async def _edit_task_card(bot, cid: int, msg_id: int, text: str, *, kb=None) -> 
         logger.exception("Неожиданная ошибка при обновлении карточки операции")
 
 
+def _detach_task_card(context: ContextTypes.DEFAULT_TYPE | None, msg_id: int) -> None:
+    """Карточка фоновой операции принадлежит задаче, а не UI: иначе «🏠 Меню»
+    (force_new) удалит её, а следующий экран перезапишет, и итог операции
+    уйдёт в мёртвое сообщение. Меню дальше живёт в новом сообщении."""
+    if context is None:
+        return
+    ud = _ud(context)
+    if ud.get(UI_MESSAGE_ID_KEY) == msg_id:
+        ud.pop(UI_MESSAGE_ID_KEY, None)
+        _save_ui_state(context)
+
+
 async def run_os_upgrade(bot, cid: int, *, context: ContextTypes.DEFAULT_TYPE | None = None) -> None:
     # Занятость уже проверена вызывающим (os_upgrade_callback, через _reject_if_busy).
     busy_set("обновление ОС")
@@ -3840,6 +4059,7 @@ async def run_os_upgrade(bot, cid: int, *, context: ContextTypes.DEFAULT_TYPE | 
         busy_clear()
         logger.exception("Не удалось запустить обновление ОС")
         raise
+    _detach_task_card(context, msg_id)
     _schedule_background_task(context, _os_upgrade_task(bot, cid, msg_id))
 
 
@@ -4093,9 +4313,7 @@ async def users_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         html_text, total_pages, users = await asyncio.to_thread(
             build_users_list_html, page, filter_mode=filter_mode
         )
-        per = USERS_PER_PAGE
-        page = max(0, min(page, total_pages - 1))
-        slice_ = users[page * per : (page + 1) * per]
+        page, slice_ = _users_page_slice(users, page, total_pages)
         kb = users_list_inline_kb(page, total_pages, slice_, filter_mode=filter_mode)
         await safe_edit_message_text(
             q,
@@ -4122,8 +4340,7 @@ async def users_filter_callback(update: Update, context: ContextTypes.DEFAULT_TY
         html_text, total_pages, users = await asyncio.to_thread(
             build_users_list_html, 0, filter_mode=filter_mode
         )
-        per = USERS_PER_PAGE
-        slice_ = users[:per]
+        _, slice_ = _users_page_slice(users, 0, total_pages)
         await safe_edit_message_text(
             q,
             clip_text(html_text),
@@ -4442,6 +4659,8 @@ async def rules_sync_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             if errors:
                 summary += "\n" + html_pre_block("\n".join(errors[:8]))
             text = await asyncio.to_thread(build_rules_sync_report) + "\n\n" + summary
+        except PrefixMapError as e:
+            text = f"⚠️ {html.escape(str(e))}"
         except Exception:
             logger.exception("Rules repair failed")
             text = "Ошибка при восстановлении rules.toml."
@@ -4461,12 +4680,17 @@ async def rules_sync_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 except CommandError as e:
                     summary += f"\n❌ {html.escape(str(e))}"
             text = await asyncio.to_thread(build_rules_sync_report) + "\n\n" + summary
+        except PrefixMapError as e:
+            text = f"⚠️ {html.escape(str(e))}"
         except Exception:
             logger.exception("Rules sync clean failed")
             text = "Ошибка при очистке rules.toml."
     else:
         await cb_answer(q)
-        text = await asyncio.to_thread(build_rules_sync_report)
+        try:
+            text = await asyncio.to_thread(build_rules_sync_report)
+        except PrefixMapError as e:
+            text = f"⚠️ {html.escape(str(e))}"
     kb = rules_sync_inline_kb()
     if q.message:
         await safe_edit_message_text(
@@ -4533,7 +4757,7 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "nav:clients":
         await cb_answer(q)
         try:
-            html_text, total_pages, _, _ = await asyncio.to_thread(clients_card_html, 0)
+            html_text, total_pages = await asyncio.to_thread(clients_card_html, 0)
             kb = clients_inline_kb(0, total_pages)
             await safe_edit_message_text(
                 q, clip_text(html_text), parse_mode=ParseMode.HTML, reply_markup=kb
@@ -4553,9 +4777,7 @@ async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             html_text, total_pages, users = await asyncio.to_thread(
                 build_users_list_html, page, filter_mode=filter_mode
             )
-            per = USERS_PER_PAGE
-            page = max(0, min(page, total_pages - 1))
-            slice_ = users[page * per : (page + 1) * per]
+            page, slice_ = _users_page_slice(users, page, total_pages)
             await safe_edit_message_text(
                 q,
                 clip_text(html_text),
@@ -4773,8 +4995,8 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _services_status_line() -> str:
-    tt = run_cmd(["systemctl", "is-active", SERVICE_NAME]) or "unknown"
-    bot = run_cmd(["systemctl", "is-active", "tt-bot.service"]) or "unknown"
+    tt = service_state(SERVICE_NAME)
+    bot = service_state("tt-bot.service")
     return f"trusttunnel: {tt} · tt-bot: {bot}"
 
 
@@ -4954,7 +5176,7 @@ async def add_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not USERNAME_RE.fullmatch(username):
         await message.reply_text("Некорректный username. Разрешены: A-Z a-z 0-9 . _ -")
         return ASK_ADD_USERNAME
-    if len(username) > MAX_USERNAME_LEN:
+    if not _username_fits_buttons(username):
         await message.reply_text(
             f"Слишком длинный username (максимум {MAX_USERNAME_LEN} символов — лимит Telegram для кнопок)."
         )
@@ -5151,6 +5373,15 @@ async def rotate_password_input(update: Update, context: ContextTypes.DEFAULT_TY
 
     message = update.message
     assert message is not None
+    # Не busy_guard: при отказе сообщение с паролем всё равно должно сгореть.
+    # Ротация делает restart сервиса — посреди apt upgrade/обновления TT нельзя.
+    label = busy_label()
+    if label is not None:
+        await _delete_message_quiet(message)
+        await message.reply_text(
+            f"⏳ Жди: {label}. Пароль не применён — отправь его снова, когда операция завершится."
+        )
+        return
     password = (message.text or "").strip()
     try:
         async with CRED_LOCK:
@@ -5162,8 +5393,8 @@ async def rotate_password_input(update: Update, context: ContextTypes.DEFAULT_TY
             uname, deeplink, png = bundle
             extra_rows = None
             if old_password is not None:
-                _set_pending_undo(context, "rotate_password", {"username": uname, "old_password": old_password})
-                extra_rows = [[InlineKeyboardButton("↩️ Отменить", callback_data="undo:go")]]
+                token = _set_pending_undo(context, "rotate_password", {"username": uname, "old_password": old_password})
+                extra_rows = [[_undo_button(token)]]
             await reply_deeplink_with_qr(
                 message,
                 username=uname,
@@ -5391,7 +5622,7 @@ async def clients_page_callback(update: Update, context: ContextTypes.DEFAULT_TY
     except ValueError:
         return
     try:
-        html_text, total_pages, _, _ = await asyncio.to_thread(clients_card_html, page)
+        html_text, total_pages = await asyncio.to_thread(clients_card_html, page)
         kb = clients_inline_kb(page, total_pages)
         await safe_edit_message_text(
             q,
@@ -5487,6 +5718,14 @@ async def restart_tt_confirm_callback(update: Update, context: ContextTypes.DEFA
             parse_mode=ParseMode.HTML,
             reply_markup=hub_inline_kb(),
         )
+    except CommandError as e:
+        # Причина (битый конфиг, отказ systemctl) — как в delete/rotate/restore.
+        logger.exception("Restart failed")
+        await best_effort_edit(q,
+            f"❌ Не удалось перезапустить сервис.\n<code>{html.escape(str(e)[:700])}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=hub_inline_kb(),
+        )
     except Exception:
         logger.exception("Restart failed")
         await best_effort_edit(q,
@@ -5565,11 +5804,38 @@ async def _undo_delete_user(q, payload: dict[str, Any]) -> None:
     )
 
 
+def _file_sha256(path: Path) -> str | None:
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
+
+
+class UndoStaleError(Exception):
+    """Файл изменён после действия — отмена затёрла бы более свежие правки."""
+
+
+def _undo_restore_file_sync(payload: dict[str, Any]) -> None:
+    target = TT_DIR / payload["filename"]
+    expected = payload.get("restored_sha256")
+    if expected is not None and _file_sha256(target) != expected:
+        raise UndoStaleError(payload["filename"])
+    snapshot = _snapshot_tt_files([target])
+    _atomic_write_bytes(target, payload["data"], mode=payload.get("mode"))
+    try:
+        apply_tt_config_change(reload_tls=payload["filename"] == "hosts.toml")
+    except Exception:
+        # Как в прямом restore: при «не удалось» на диске остаётся прежнее.
+        _restore_tt_files(snapshot)
+        _ensure_tt_running_best_effort()
+        raise
+
+
 async def _undo_restore_file(q, payload: dict[str, Any]) -> None:
     filename = payload["filename"]
-    async with CRED_LOCK:
-        await asyncio.to_thread(_atomic_write_bytes, TT_DIR / filename, payload["data"], mode=payload.get("mode"))
-    await asyncio.to_thread(apply_tt_config_change)
+    try:
+        async with CRED_LOCK:
+            await asyncio.to_thread(_undo_restore_file_sync, payload)
+    except UndoStaleError:
+        await cb_answer(q, f"{filename} изменён после восстановления — отмена затёрла бы новые правки", alert=True)
+        return
     await cb_answer(q, "Восстановлено обратно", alert=True)
     await safe_edit_message_text(q,
         f"↩️ <code>{html.escape(filename)}</code> возвращён к состоянию до восстановления.",
@@ -5590,11 +5856,16 @@ async def undo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not q:
         return
     data = q.data or ""
-    if data != "undo:go":
+    if not data.startswith("undo:"):
         return
-    info = _pop_pending_undo(context)
+    token = data.split(":", 1)[1]
+    has_slot = PENDING_UNDO_KEY in _ud(context)
+    info = _pop_pending_undo(context, None if token == "go" else token)
     if not info:
-        await cb_answer(q, "Отменять уже нечего", alert=True)
+        if has_slot and PENDING_UNDO_KEY in _ud(context):
+            await cb_answer(q, "Эта отмена неактуальна: после неё было другое действие", alert=True)
+        else:
+            await cb_answer(q, "Отменять уже нечего", alert=True)
         return
     handler = _UNDO_HANDLERS.get(info["kind"])
     if handler is None:
@@ -5674,7 +5945,7 @@ async def delete_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             kb = hub_inline_kb()
             if old_password is not None:
-                _set_pending_undo(
+                token = _set_pending_undo(
                     context,
                     "delete_user",
                     {
@@ -5684,7 +5955,7 @@ async def delete_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                         "protocol": prof.get("protocol", "h2"),
                     },
                 )
-                kb = _with_undo_row(kb)
+                kb = _with_undo_row(kb, token)
             await safe_edit_message_text(q,
                 f"Действие: <code>удаление</code>\n"
                 f"Пользователь: <code>{html.escape(username)}</code>"
@@ -5760,15 +6031,19 @@ async def restore_backup_callback(update: Update, context: ContextTypes.DEFAULT_
             )
             return
         # to_thread: синхронный systemctl заморозил бы event loop на весь timeout.
-        svc = (
-            await asyncio.to_thread(run_cmd, ["systemctl", "is-active", SERVICE_NAME])
-            or "unknown"
-        )
+        svc = await asyncio.to_thread(service_state, SERVICE_NAME)
         restored_label = "все файлы" if filename == "__all__" else filename
         kb = hub_inline_kb()
         if prev_data is not None:
-            _set_pending_undo(context, "restore_file", {"filename": filename, "data": prev_data, "mode": prev_mode})
-            kb = _with_undo_row(kb)
+            # Отпечаток восстановленного содержимого: если файл потом изменится
+            # (добавили юзера, синхронизировали rules), отмена его не затрёт.
+            restored_sha = await asyncio.to_thread(_file_sha256, TT_DIR / filename)
+            token = _set_pending_undo(
+                context,
+                "restore_file",
+                {"filename": filename, "data": prev_data, "mode": prev_mode, "restored_sha256": restored_sha},
+            )
+            kb = _with_undo_row(kb, token)
         await safe_edit_message_text(q,
             "Действие: <code>восстановление из бэкапа</code>\n"
             f"Файл: <code>{html.escape(restored_label)}</code>\n"
@@ -5793,6 +6068,8 @@ async def _tt_upgrade_task(bot, cid: int, msg_id: int, pending: dict[str, str]) 
             await asyncio.to_thread(_backup_tt_binary)
             await _edit_task_card(bot, cid, msg_id, "⏳ <b>Обновление TrustTunnel</b>\n[2/4] Устанавливаю новую версию…")
             code, out, err = await asyncio.to_thread(_tt_install_sync, pending["latest"])
+            # Бинарник мог смениться при любом исходе — кэш версии (30с) устарел.
+            cache_invalidate("tt_version")
             if code != 0:
                 await asyncio.to_thread(_restore_tt_binary_backup)
                 await asyncio.to_thread(_tt_start_best_effort)
@@ -5888,6 +6165,7 @@ async def update_tt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         busy_clear()
         logger.exception("Не удалось запустить обновление TrustTunnel")
         return
+    _detach_task_card(context, msg.message_id)
     _schedule_background_task(
         context,
         _tt_upgrade_task(context.bot, _chat_id(update), msg.message_id, pending),
@@ -5989,28 +6267,40 @@ CALLBACK_ROUTES: tuple[CallbackRoute, ...] = (
     CallbackRoute("rules_sync_callback", r"^rulesync:", rules_sync_callback),
     CallbackRoute("logs_filter_callback", r"^logf:", logs_filter_callback),
     CallbackRoute("restart_tt_confirm_callback", r"^ttrst_(yes|no)$", restart_tt_confirm_callback),
-    CallbackRoute("undo_callback", r"^undo:go$", undo_callback),
+    CallbackRoute("undo_callback", r"^undo:[0-9a-z]+$", undo_callback),
 )
 
 
-def cancel_stray_add_flow(handler):
-    """Любой маршрут из CALLBACK_ROUTES не относится к сценарию добавления
-    пользователя (он живёт в своём ConversationHandler) — если юзер ушёл
-    в другой раздел посреди добавления, сценарий надо считать брошенным,
-    иначе следующий текст улетит в него как забытый пароль/username."""
+def abandon_pending_inputs(handler):
+    """Нажатие любой кнопки маршрута из CALLBACK_ROUTES бросает все
+    ожидания текстового ввода: add-flow (живёт в своём ConversationHandler),
+    новый пароль ротации и поисковый запрос. Иначе следующий текст улетит в
+    забытый сценарий — например, станет новым паролем пользователя.
+    Маршрут, начинающий ожидание (urot/rotpick/vpn:find), ставит его заново
+    уже после этой обёртки. Черновики брошенного сценария сгорают, кроме
+    сообщения, с которого пришёл колбэк: его переиспользует сам хендлер."""
     @functools.wraps(handler)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if _ud(context).get("add_flow_active"):
+        ud = _ud(context)
+        source = _accessible(update.callback_query.message) if update.callback_query else None
+        if ud.get("add_flow_active"):
             await cancel_add_flow(context)
+        if ud.pop("pending_rotate_username", None):
+            await _burn_scaffold(context.bot, context, ROTATE_SCAFFOLD_KEY, keep=source)
+        if ud.pop("pending_user_search", None):
+            await _burn_scaffold(context.bot, context, USER_SEARCH_SCAFFOLD_KEY, keep=source)
         return await handler(update, context)
 
     return wrapper
 
 
 def build_callback_query_handler(route: CallbackRoute) -> CallbackQueryHandler:
-    handler = busy_guard(route.handler) if route.busy else route.handler
+    # Снаружи внутрь: allow → busy → сброс ожиданий ввода → хендлер. Колбэк,
+    # отклонённый по доступу или busy, не должен ломать начатый сценарий.
+    handler = abandon_pending_inputs(route.handler)
+    if route.busy:
+        handler = busy_guard(handler)
     handler = allow_guard(handler)
-    handler = cancel_stray_add_flow(handler)
     return CallbackQueryHandler(traced_callback(route.name, handler), pattern=route.pattern)
 
 

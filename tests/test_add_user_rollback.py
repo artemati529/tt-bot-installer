@@ -128,5 +128,7 @@ def test_add_user_random_prefix_rolls_back_map_and_rules_on_late_failure(
 
     assert bot_tt.list_usernames() == ["old"]
     assert not prefix_file.exists() or "newuser" not in prefix_file.read_text(encoding="utf-8")
-    assert "newuser" not in rules_file.read_text(encoding="utf-8")
-    assert "newpfx" not in rules_file.read_text(encoding="utf-8")
+    # rules.toml до операции не было — точный откат его и убирает.
+    rules_after = rules_file.read_text(encoding="utf-8") if rules_file.exists() else ""
+    assert "newuser" not in rules_after
+    assert "newpfx" not in rules_after

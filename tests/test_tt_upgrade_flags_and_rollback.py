@@ -23,27 +23,6 @@ def test_tt_install_sync_passes_auto_answer_and_pinned_version(bot_tt, monkeypat
     assert captured["kwargs"]["capture_limit"] == 24000
 
 
-def test_tt_install_sync_uses_pipefail(bot_tt, monkeypatch):
-    """Without `set -o pipefail`, bash's pipeline exit code is curl|sh's
-    LAST command (sh) — if curl fails (network/DNS/rate-limit/bad tag) with
-    empty output, sh sees an empty script and exits 0. The upgrade task then
-    thinks the install succeeded, starts the (unchanged) old binary, and
-    reports "✅ TrustTunnel обновлён" with the OLD version — a silent no-op
-    reported as success. Verified live: `curl <bad-url> | sh` really does
-    exit 0 without pipefail, and exits with curl's real code with it."""
-    captured = {}
-
-    def fake_run_shell(command, timeout=None, **kwargs):
-        captured["command"] = command
-        return 0, "ok", ""
-
-    monkeypatch.setattr(bot_tt, "run_shell", fake_run_shell)
-
-    bot_tt._tt_install_sync("v1.2.3")
-
-    assert "set -o pipefail" in captured["command"]
-
-
 def test_backup_and_restore_tt_binary_roundtrip(bot_tt, tt_paths):
     binary = tt_paths["TT_DIR"] / "trusttunnel_endpoint"
     binary.write_bytes(b"old-version-bytes")

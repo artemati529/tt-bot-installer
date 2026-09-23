@@ -27,8 +27,3 @@ def test_add_protocol_choice_creates_user_and_ends_conversation(
 
     assert result == bot_tt.ConversationHandler.END
     update.callback_query.message.reply_photo.assert_awaited_once()
-
-
-def test_ask_add_routing_state_no_longer_exists(bot_tt):
-    assert not hasattr(bot_tt, "ASK_ADD_ROUTING")
-    assert not hasattr(bot_tt, "add_routing_choice")

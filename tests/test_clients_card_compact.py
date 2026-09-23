@@ -25,11 +25,9 @@ def test_clients_card_uses_compact_rows_without_session_counts(bot_tt, monkeypat
         ],
     )
 
-    text, total_pages, total_sessions, stale = bot_tt.clients_card_html(0)
+    text, total_pages = bot_tt.clients_card_html(0)
 
     assert total_pages == 1
-    assert total_sessions == 3
-    assert stale is False
     assert "сесс" not in text
     assert "📈 +" not in text
     assert "1. 🟢 <b>bob</b>\n    📥 <code>12.0 MiB</code> · 📤 <code>34.0 MiB</code>" in text

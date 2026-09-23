@@ -1,5 +1,6 @@
 """Ротация пароля: успех вешает pending_undo("rotate_password", old_password)
 и добавляет кнопку «Отменить» на карточку с deeplink."""
+import re
 from unittest.mock import AsyncMock
 
 
@@ -26,7 +27,8 @@ def test_rotate_success_sets_pending_undo_with_old_password(
 
     kb = update.message.reply_photo.call_args.kwargs["reply_markup"]
     buttons = [b.callback_data for row in kb.inline_keyboard for b in row]
-    assert "undo:go" in buttons
+    # Кнопка несёт токен своего действия, а не общий undo:go.
+    assert any(re.fullmatch(r"undo:[0-9a-f]{8}", b or "") for b in buttons)
 
 
 def test_rotate_failure_does_not_set_pending_undo(

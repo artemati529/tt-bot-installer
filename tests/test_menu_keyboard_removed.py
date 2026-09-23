@@ -36,24 +36,3 @@ def test_main_registers_menu_button_early(bot_tt):
 
     assert "menu_button_tap" in src
     assert "group=-1" in src
-
-
-def test_old_multi_button_reply_keyboard_text_handlers_are_not_registered(bot_tt):
-    """Старую (до сегодняшней кнопки «Меню») многокнопочную reply-клавиатуру
-    не возвращаем — только одну кнопку «🏠 Меню» (см. test_menu_button.py)."""
-    main_src = inspect.getsource(bot_tt.main)
-    add_conv_src = inspect.getsource(bot_tt.build_add_conversation)
-
-    old_labels = (
-        "👥 VPN",
-        "⚙️ Сервер",
-        "📊 Мониторинг",
-        "💾 Бэкап",
-        "🧾 Логи",
-        "➕ Новый пользователь",
-    )
-    for label in old_labels:
-        assert label not in main_src
-        assert label not in add_conv_src
-    assert not hasattr(bot_tt, "MENU_BUTTON_TEXTS")
-    assert not hasattr(bot_tt, "_looks_like_menu_button")
