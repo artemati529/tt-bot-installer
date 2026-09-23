@@ -2,10 +2,18 @@
 
 [![TrustTunnel](https://img.shields.io/badge/for-TrustTunnel-blue?logo=github)](https://github.com/TrustTunnel/TrustTunnel)
 [![tests](https://github.com/artemati529/tt-bot-installer/actions/workflows/tests.yml/badge.svg)](https://github.com/artemati529/tt-bot-installer/actions/workflows/tests.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Checked with mypy](https://www.mypy-lang.org/static/mypy_badge.svg)](https://mypy-lang.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Устанавливает Telegram-бот администрирования [TrustTunnel](https://github.com/TrustTunnel/TrustTunnel)
 VPN на чистую Debian/Ubuntu VM. **Не устанавливает и не настраивает сам
 TrustTunnel** — это отдельный шаг, см. [официальный проект](https://github.com/TrustTunnel/TrustTunnel).
+
+<p align="center">
+  <img src="docs/screenshot.jpg" width="320" alt="Главное меню бота">
+</p>
 
 ## Предварительные условия
 
@@ -97,6 +105,10 @@ pytest tests/ -q
 - `bot.py` — исходник бота.
 - `requirements.txt` — зафиксированные версии зависимостей.
 - `requirements-dev.txt`, `tests/` — тесты для `bot.py`.
+- `CHANGELOG.md` — история версий.
+- `LICENSE` — лицензия MIT.
+- `.github/` — CI (тесты, shellcheck) и Dependabot.
+- `docs/screenshot.jpg` — скриншот для README.
 
 ## Ссылки
 
