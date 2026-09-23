@@ -1,6 +1,7 @@
 # tt-bot installer
 
 [![TrustTunnel](https://img.shields.io/badge/for-TrustTunnel-blue?logo=github)](https://github.com/TrustTunnel/TrustTunnel)
+[![tests](https://github.com/artemati529/tt-bot-installer/actions/workflows/tests.yml/badge.svg)](https://github.com/artemati529/tt-bot-installer/actions/workflows/tests.yml)
 
 Устанавливает Telegram-бот администрирования [TrustTunnel](https://github.com/TrustTunnel/TrustTunnel)
 VPN на чистую Debian/Ubuntu VM. **Не устанавливает и не настраивает сам
